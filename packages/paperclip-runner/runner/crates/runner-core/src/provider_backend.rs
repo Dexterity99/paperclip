@@ -400,18 +400,11 @@ impl CodexCommandExecutor {
         self.save_state()?;
         Ok(CommandExecution {
             result: json!({"status": "accepted", "providerTurnId": provider_turn_id}),
-            events: vec![
-                (
-                    "turn.accepted".to_owned(),
-                    EventPriority::P0,
-                    json!({"provider": "codex", "providerSessionId": thread_id, "providerTurnId": provider_turn_id}),
-                ),
-                (
-                    "turn.started".to_owned(),
-                    EventPriority::P0,
-                    json!({"provider": "codex", "providerSessionId": thread_id, "providerTurnId": provider_turn_id}),
-                ),
-            ],
+            events: vec![(
+                "turn.accepted".to_owned(),
+                EventPriority::P0,
+                json!({"provider": "codex", "providerSessionId": thread_id, "providerTurnId": provider_turn_id}),
+            )],
         })
     }
 

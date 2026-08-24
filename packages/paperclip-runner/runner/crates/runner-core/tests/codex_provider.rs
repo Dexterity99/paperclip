@@ -187,7 +187,7 @@ fn structured_question_round_trips_through_the_normalized_backend() {
     executor
         .execute(&command("open", 2, "session.open", json!({})))
         .expect("open provider session");
-    executor
+    let started = executor
         .execute(&command(
             "turn",
             3,
@@ -195,10 +195,14 @@ fn structured_question_round_trips_through_the_normalized_backend() {
             json!({"text": "Ask for deployment input."}),
         ))
         .expect("start provider turn");
+    assert_eq!(started.events.len(), 1);
+    assert_eq!(started.events[0].0, "turn.accepted");
 
     let mut question_set = None;
+    let mut provider_started_events = 0;
     for _ in 0..16 {
         for (event_type, _, payload) in executor.poll_events().expect("poll question") {
+            provider_started_events += usize::from(event_type == "turn.started");
             if event_type == "runtime_request.created" {
                 assert_eq!(payload["request"]["schema"], "paperclip.runtime_request.v2");
                 question_set = payload.pointer("/request/input").cloned();
@@ -209,6 +213,7 @@ fn structured_question_round_trips_through_the_normalized_backend() {
         }
     }
     let question_set = question_set.expect("normalized question set is emitted");
+    assert_eq!(provider_started_events, 1);
     assert_eq!(question_set["schema"], "paperclip.question_set.v1");
     assert_eq!(
         question_set["questions"][0]["options"][0]["label"],

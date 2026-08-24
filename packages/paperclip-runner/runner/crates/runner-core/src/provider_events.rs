@@ -98,15 +98,6 @@ pub fn normalize_codex_notification(method: &str, params: &Value) -> Vec<Normali
     };
 
     match method {
-        "thread/started" => push(
-            &mut events,
-            "session.started",
-            EventPriority::P0,
-            json!({
-                "provider": "codex",
-                "providerSessionId": params.pointer("/thread/id").or_else(|| params.get("threadId")).and_then(Value::as_str),
-            }),
-        ),
         "thread/compacted" => push(
             &mut events,
             "context.compacted",

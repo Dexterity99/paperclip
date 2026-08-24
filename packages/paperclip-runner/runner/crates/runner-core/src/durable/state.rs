@@ -228,7 +228,95 @@ impl DurableState {
         priority: EventPriority,
         payload: Value,
     ) -> Result<u64, DurableRunnerError> {
+        let source_event_id = format!(
+            "event_{}_{:016}",
+            self.runner_instance_id, self.next_source_seq
+        );
+        self.enqueue_event_with_source_event_id(
+            config,
+            source_event_id,
+            event_type,
+            priority,
+            payload,
+        )
+    }
+
+    pub(crate) fn source_event_id_for_executor(
+        &self,
+        executor_event_id: &str,
+    ) -> Result<String, DurableRunnerError> {
+        if executor_event_id.is_empty()
+            || executor_event_id.len() > 160
+            || executor_event_id.chars().any(char::is_control)
+        {
+            return Err(DurableRunnerError::invalid(
+                "executor event identity is empty, oversized, or contains control characters",
+            ));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"paperclip.executor-event.v1\0");
+        hasher.update(self.runner_instance_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(executor_event_id.as_bytes());
+        Ok(format!("event_executor_{:x}", hasher.finalize()))
+    }
+
+    pub(crate) fn has_source_event_id(&self, source_event_id: &str) -> bool {
+        self.outbox.iter().any(|event| {
+            event
+                .envelope
+                .pointer("/payload/sourceEventId")
+                .and_then(Value::as_str)
+                == Some(source_event_id)
+        })
+    }
+
+    pub(crate) fn matches_queued_source_event(
+        &self,
+        source_event_id: &str,
+        event_type: &str,
+        priority: EventPriority,
+        payload: &Value,
+    ) -> Result<bool, DurableRunnerError> {
+        let Some(existing) = self.outbox.iter().find(|event| {
+            event
+                .envelope
+                .pointer("/payload/sourceEventId")
+                .and_then(Value::as_str)
+                == Some(source_event_id)
+        }) else {
+            return Ok(false);
+        };
+        let sanitized_payload = sanitize_value(payload);
+        if existing.event_type != event_type
+            || existing.priority != priority.number()
+            || existing.envelope.pointer("/payload/payload") != Some(&sanitized_payload)
+        {
+            return Err(DurableRunnerError::invalid(
+                "executor event identity was reused with different event data",
+            ));
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn enqueue_event_with_source_event_id(
+        &mut self,
+        config: &DurableRunnerConfig,
+        source_event_id: String,
+        event_type: impl Into<String>,
+        priority: EventPriority,
+        payload: Value,
+    ) -> Result<u64, DurableRunnerError> {
         let event_type = event_type.into();
+        if source_event_id.is_empty()
+            || source_event_id.len() > 160
+            || source_event_id.chars().any(char::is_control)
+            || self.has_source_event_id(&source_event_id)
+        {
+            return Err(DurableRunnerError::invalid(
+                "source event identity is malformed or already queued",
+            ));
+        }
         if event_type.is_empty()
             || event_type.len() > 160
             || event_type.chars().any(char::is_control)
@@ -257,7 +345,7 @@ impl DurableState {
             "itemId": self.item_id,
             "payload": {
                 "schema": "paperclip.prp.event.v1",
-                "sourceEventId": format!("event_{}_{source_seq:016}", self.runner_instance_id),
+                "sourceEventId": source_event_id,
                 "sourceSeq": source_seq,
                 "sourceInstanceId": self.runner_instance_id,
                 "sourceKind": "runner",

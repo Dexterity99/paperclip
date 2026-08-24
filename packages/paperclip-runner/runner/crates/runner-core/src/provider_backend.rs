@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use crate::codex_provider::{CodexProvider, CodexProviderConfig, CodexProviderEvent};
 use crate::durable::{
     create_private_temporary_file, open_private_regular_file, verify_private_directory, Command,
-    CommandExecution, CommandExecutor, DurableRunnerError, EventPriority,
+    CommandExecution, CommandExecutor, DurableRunnerError, EventPriority, PolledEvent,
 };
 use crate::provider_events::{normalize_codex_notification, NormalizedProviderEvent};
 
@@ -22,6 +22,19 @@ const PROVIDER_STATE_SCHEMA: &str = "paperclip.runner.codex-provider-state.v1";
 const PROVIDER_STATE_FILE: &str = "codex-provider-state.json";
 const MAX_PROVIDER_STATE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_EVENTS_PER_POLL: usize = 128;
+
+fn initial_provider_event_seq() -> u64 {
+    1
+}
+
+fn provider_event_id(sequence: u64) -> String {
+    format!("codex_provider_{sequence:016}")
+}
+
+fn provider_event_sequence(event_id: &str) -> Option<u64> {
+    let sequence = event_id.strip_prefix("codex_provider_")?.parse().ok()?;
+    (provider_event_id(sequence) == event_id).then_some(sequence)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -36,7 +49,9 @@ struct CodexProviderState {
     #[serde(default)]
     active_provider_turn_id: Option<String>,
     #[serde(default)]
-    pending_events: VecDeque<NormalizedProviderEvent>,
+    pending_events: VecDeque<PolledEvent>,
+    #[serde(default = "initial_provider_event_seq")]
+    next_provider_event_seq: u64,
 }
 
 impl CodexProviderState {
@@ -49,6 +64,7 @@ impl CodexProviderState {
             provider_session_id: None,
             active_provider_turn_id: None,
             pending_events: VecDeque::new(),
+            next_provider_event_seq: initial_provider_event_seq(),
         }
     }
 
@@ -56,6 +72,7 @@ impl CodexProviderState {
         self.config
             .validate()
             .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        let mut pending_event_ids = HashSet::new();
         if self.schema != PROVIDER_STATE_SCHEMA
             || !matches!(
                 self.lifecycle.as_str(),
@@ -82,9 +99,13 @@ impl CodexProviderState {
                 self.lifecycle.as_str(),
                 "prepared" | "session_open" | "closed"
             ) && self.active_provider_turn_id.is_some())
+            || self.next_provider_event_seq == 0
             || self.pending_events.len() > MAX_EVENTS_PER_POLL + 1
             || self.pending_events.iter().any(|event| {
-                event.event_type.is_empty()
+                provider_event_sequence(&event.executor_event_id)
+                    .is_none_or(|sequence| sequence >= self.next_provider_event_seq)
+                    || !pending_event_ids.insert(event.executor_event_id.as_str())
+                    || event.event_type.is_empty()
                     || event.event_type.len() > 160
                     || event.event_type.chars().any(char::is_control)
                     || !event.payload.is_object()
@@ -93,6 +114,30 @@ impl CodexProviderState {
             return Err(DurableRunnerError::invalid(
                 "Codex provider state is malformed or inconsistent",
             ));
+        }
+        Ok(())
+    }
+
+    fn push_event(&mut self, event: NormalizedProviderEvent) -> Result<(), DurableRunnerError> {
+        let sequence = self.next_provider_event_seq;
+        self.next_provider_event_seq = sequence
+            .checked_add(1)
+            .ok_or_else(|| DurableRunnerError::invalid("provider event sequence exhausted"))?;
+        self.pending_events.push_back(PolledEvent {
+            executor_event_id: provider_event_id(sequence),
+            event_type: event.event_type,
+            priority: event.priority,
+            payload: event.payload,
+        });
+        Ok(())
+    }
+
+    fn extend_events(
+        &mut self,
+        events: impl IntoIterator<Item = NormalizedProviderEvent>,
+    ) -> Result<(), DurableRunnerError> {
+        for event in events {
+            self.push_event(event)?;
         }
         Ok(())
     }
@@ -187,7 +232,7 @@ impl CodexCommandExecutor {
             } else {
                 "session_open".to_owned()
             };
-            state.pending_events.push_back(NormalizedProviderEvent {
+            state.push_event(NormalizedProviderEvent {
                 event_type: "session.reconciled".to_owned(),
                 priority: EventPriority::P0,
                 payload: json!({
@@ -196,7 +241,7 @@ impl CodexCommandExecutor {
                     "previousProviderTurnId": previous_active_turn_id,
                     "activeProviderTurnId": recovered_active_turn_id,
                 }),
-            });
+            })?;
             self.save_state()?;
         }
         Ok(())
@@ -563,7 +608,7 @@ impl CodexCommandExecutor {
                         state.active_provider_turn_id = None;
                         state.lifecycle = "session_open".to_owned();
                     }
-                    state.pending_events.extend(normalized);
+                    state.extend_events(normalized)?;
                     self.save_state()?;
                 }
                 CodexProviderEvent::RuntimeRequest {
@@ -578,8 +623,7 @@ impl CodexCommandExecutor {
                     self.state
                         .as_mut()
                         .expect("Codex state remains available while polling")
-                        .pending_events
-                        .push_back(NormalizedProviderEvent {
+                        .push_event(NormalizedProviderEvent {
                             event_type: "runtime_request.created".to_owned(),
                             priority: EventPriority::P0,
                             payload: json!({
@@ -598,14 +642,14 @@ impl CodexCommandExecutor {
                                     },
                                 },
                             }),
-                        });
+                        })?;
                     self.save_state()?;
                 }
                 CodexProviderEvent::Exited { exit_code, success } => {
                     self.provider = None;
                     if let Some(state) = self.state.as_mut() {
                         state.lifecycle = "provider_exited".to_owned();
-                        state.pending_events.push_back(NormalizedProviderEvent {
+                        state.push_event(NormalizedProviderEvent {
                             event_type: "session.failed".to_owned(),
                             priority: EventPriority::P0,
                             payload: json!({
@@ -614,7 +658,7 @@ impl CodexCommandExecutor {
                                 "exitCode": exit_code,
                                 "expected": success,
                             }),
-                        });
+                        })?;
                     }
                     self.save_state()?;
                     break;
@@ -662,20 +706,14 @@ impl CommandExecutor for CodexCommandExecutor {
         }
     }
 
-    fn poll_events(&mut self) -> Result<Vec<(String, EventPriority, Value)>, DurableRunnerError> {
+    fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
         self.poll_provider()?;
         Ok(self
             .state
             .as_ref()
             .into_iter()
             .flat_map(|state| state.pending_events.iter())
-            .map(|event| {
-                (
-                    event.event_type.clone(),
-                    event.priority,
-                    event.payload.clone(),
-                )
-            })
+            .cloned()
             .collect())
     }
 
@@ -736,6 +774,7 @@ mod tests {
             provider_session_id: None,
             active_provider_turn_id: None,
             pending_events: VecDeque::new(),
+            next_provider_event_seq: initial_provider_event_seq(),
         };
         assert!(state.validate().is_err());
     }

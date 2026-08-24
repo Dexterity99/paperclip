@@ -1,6 +1,7 @@
 use std::thread;
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::state::{
@@ -19,6 +20,15 @@ pub struct CommandExecution {
     pub events: Vec<(String, EventPriority, Value)>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolledEvent {
+    pub executor_event_id: String,
+    pub event_type: String,
+    pub priority: EventPriority,
+    pub payload: Value,
+}
+
 impl CommandExecution {
     pub fn result(result: Value) -> Self {
         Self {
@@ -31,7 +41,7 @@ impl CommandExecution {
 pub trait CommandExecutor {
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError>;
 
-    fn poll_events(&mut self) -> Result<Vec<(String, EventPriority, Value)>, DurableRunnerError> {
+    fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
         Ok(Vec::new())
     }
 
@@ -296,11 +306,27 @@ fn poll_executor_events<E: CommandExecutor>(
     if events.is_empty() {
         return Ok(());
     }
-    for (event_type, priority, payload) in events {
+    for event in events {
         // Commit and acknowledge one event at a time. If a later event is
         // oversized or the outbox is full, the accepted prefix is already
         // durable and the unacknowledged suffix remains with the executor.
-        state.enqueue_event(config, event_type, priority, payload)?;
+        let source_event_id = state.source_event_id_for_executor(&event.executor_event_id)?;
+        if state.matches_queued_source_event(
+            &source_event_id,
+            &event.event_type,
+            event.priority,
+            &event.payload,
+        )? {
+            executor.acknowledge_events(1)?;
+            continue;
+        }
+        state.enqueue_event_with_source_event_id(
+            config,
+            source_event_id,
+            event.event_type,
+            event.priority,
+            event.payload,
+        )?;
         store.save(state)?;
         executor.acknowledge_events(1)?;
     }
@@ -411,7 +437,8 @@ mod tests {
     }
 
     struct RetainingEventExecutor {
-        events: VecDeque<(String, EventPriority, Value)>,
+        events: VecDeque<PolledEvent>,
+        fail_acknowledgement: bool,
     }
 
     impl CommandExecutor for CountingExecutor {
@@ -426,13 +453,16 @@ mod tests {
             Ok(CommandExecution::result(json!({"status": "completed"})))
         }
 
-        fn poll_events(
-            &mut self,
-        ) -> Result<Vec<(String, EventPriority, Value)>, DurableRunnerError> {
+        fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
             Ok(self.events.iter().cloned().collect())
         }
 
         fn acknowledge_events(&mut self, count: usize) -> Result<(), DurableRunnerError> {
+            if self.fail_acknowledgement {
+                return Err(DurableRunnerError::invalid(
+                    "simulated crash before provider acknowledgement",
+                ));
+            }
             if count > self.events.len() {
                 return Err(DurableRunnerError::invalid(
                     "test acknowledgement exceeded pending events",
@@ -489,17 +519,20 @@ mod tests {
         let (mut state, _) = store.load_or_create(&config).unwrap();
         let mut executor = RetainingEventExecutor {
             events: VecDeque::from([
-                (
-                    "provider.notice.recorded".to_owned(),
-                    EventPriority::P1,
-                    json!({"message": "durable prefix"}),
-                ),
-                (
-                    "provider.notice.recorded".to_owned(),
-                    EventPriority::P1,
-                    json!({"message": "x".repeat(2048)}),
-                ),
+                PolledEvent {
+                    executor_event_id: "provider-event-1".to_owned(),
+                    event_type: "provider.notice.recorded".to_owned(),
+                    priority: EventPriority::P1,
+                    payload: json!({"message": "durable prefix"}),
+                },
+                PolledEvent {
+                    executor_event_id: "provider-event-2".to_owned(),
+                    event_type: "provider.notice.recorded".to_owned(),
+                    priority: EventPriority::P1,
+                    payload: json!({"message": "x".repeat(2048)}),
+                },
             ]),
+            fail_acknowledgement: false,
         };
 
         let error = poll_executor_events(&mut state, &store, &config, &mut executor)
@@ -509,13 +542,62 @@ mod tests {
         assert_eq!(state.outbox[0].event_type, "provider.notice.recorded");
         assert_eq!(executor.events.len(), 1);
         assert_eq!(
-            executor.events[0].2["message"],
+            executor.events[0].payload["message"],
             Value::String("x".repeat(2048))
         );
 
         let (reloaded, recovered) = store.load_or_create(&config).unwrap();
         assert!(recovered);
         assert_eq!(reloaded.outbox.len(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_acknowledges_an_event_already_in_the_outbox_without_duplication() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-event-ack-crash-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let config = config(directory.clone());
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let mut executor = RetainingEventExecutor {
+            events: VecDeque::from([PolledEvent {
+                executor_event_id: "provider-event-before-ack-crash".to_owned(),
+                event_type: "provider.notice.recorded".to_owned(),
+                priority: EventPriority::P1,
+                payload: json!({"message": "deliver exactly once"}),
+            }]),
+            fail_acknowledgement: true,
+        };
+
+        let error = poll_executor_events(&mut state, &store, &config, &mut executor)
+            .expect_err("simulate a crash after outbox persistence");
+        assert!(error
+            .to_string()
+            .contains("before provider acknowledgement"));
+        assert_eq!(state.outbox.len(), 1);
+        assert_eq!(executor.events.len(), 1);
+        let source_event_id = state.outbox[0].envelope["payload"]["sourceEventId"].clone();
+
+        let (mut recovered_state, recovered) = store.load_or_create(&config).unwrap();
+        assert!(recovered);
+        executor.fail_acknowledgement = false;
+        executor.events[0].payload = json!({"message": "different data"});
+        let mismatch = poll_executor_events(&mut recovered_state, &store, &config, &mut executor)
+            .expect_err("a retained identity cannot name different event data");
+        assert!(mismatch.to_string().contains("reused with different"));
+        executor.events[0].payload = json!({"message": "deliver exactly once"});
+        poll_executor_events(&mut recovered_state, &store, &config, &mut executor)
+            .expect("recovery acknowledges the retained provider copy");
+        assert!(executor.events.is_empty());
+        assert_eq!(recovered_state.outbox.len(), 1);
+        assert_eq!(
+            recovered_state.outbox[0].envelope["payload"]["sourceEventId"],
+            source_event_id
+        );
+        assert_eq!(recovered_state.highest_source_seq(), 1);
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use paperclip_runner_core::codex_provider::{
     CodexProvider, CodexProviderConfig, CodexProviderEvent,
 };
-use paperclip_runner_core::durable::{Command, CommandExecutor, DurableRunnerError, EventPriority};
+use paperclip_runner_core::durable::{Command, CommandExecutor, DurableRunnerError, PolledEvent};
 use paperclip_runner_core::provider_backend::CodexCommandExecutor;
 use paperclip_runner_core::provider_events::normalize_codex_notification;
 use serde_json::{json, Value};
@@ -73,7 +73,7 @@ fn call_count(directory: &Path, method: &str) -> usize {
 
 fn poll_and_ack(
     executor: &mut CodexCommandExecutor,
-) -> Result<Vec<(String, EventPriority, Value)>, DurableRunnerError> {
+) -> Result<Vec<PolledEvent>, DurableRunnerError> {
     let events = executor.poll_events()?;
     executor.acknowledge_events(events.len())?;
     Ok(events)
@@ -167,7 +167,7 @@ fn durable_backend_resumes_the_active_thread_without_restarting_the_turn() {
         let events = poll_and_ack(&mut recovered).expect("poll interrupted turn");
         terminal_seen |= events
             .iter()
-            .any(|(event_type, _, _)| event_type == "turn.interrupted");
+            .any(|event| event.event_type == "turn.interrupted");
         if terminal_seen {
             break;
         }
@@ -209,7 +209,7 @@ fn provider_exit_preserves_and_reconciles_the_active_turn() {
         provider_exit_seen |= poll_and_ack(&mut executor)
             .expect("poll provider exit")
             .iter()
-            .any(|(event_type, _, _)| event_type == "session.failed");
+            .any(|event| event.event_type == "session.failed");
         if provider_exit_seen {
             break;
         }
@@ -236,7 +236,7 @@ fn provider_exit_preserves_and_reconciles_the_active_turn() {
         terminal_seen |= poll_and_ack(&mut executor)
             .expect("poll reconciled interruption")
             .iter()
-            .any(|(event_type, _, _)| event_type == "turn.interrupted");
+            .any(|event| event.event_type == "turn.interrupted");
         if terminal_seen {
             break;
         }
@@ -276,7 +276,7 @@ fn unacknowledged_provider_events_survive_executor_restart() {
         let events = first.poll_events().expect("poll provider events");
         if events
             .iter()
-            .any(|(event_type, _, _)| event_type == "runtime_request.created")
+            .any(|event| event.event_type == "runtime_request.created")
         {
             retained = Some(events);
             break;
@@ -333,11 +333,14 @@ fn structured_question_round_trips_through_the_normalized_backend() {
     let mut question_set = None;
     let mut provider_started_events = 0;
     for _ in 0..16 {
-        for (event_type, _, payload) in poll_and_ack(&mut executor).expect("poll question") {
-            provider_started_events += usize::from(event_type == "turn.started");
-            if event_type == "runtime_request.created" {
-                assert_eq!(payload["request"]["schema"], "paperclip.runtime_request.v2");
-                question_set = payload.pointer("/request/input").cloned();
+        for event in poll_and_ack(&mut executor).expect("poll question") {
+            provider_started_events += usize::from(event.event_type == "turn.started");
+            if event.event_type == "runtime_request.created" {
+                assert_eq!(
+                    event.payload["request"]["schema"],
+                    "paperclip.runtime_request.v2"
+                );
+                question_set = event.payload.pointer("/request/input").cloned();
             }
         }
         if question_set.is_some() {
@@ -371,7 +374,7 @@ fn structured_question_round_trips_through_the_normalized_backend() {
         completed |= poll_and_ack(&mut executor)
             .expect("poll completed question turn")
             .iter()
-            .any(|(event_type, _, _)| event_type == "turn.completed");
+            .any(|event| event.event_type == "turn.completed");
         if completed {
             break;
         }

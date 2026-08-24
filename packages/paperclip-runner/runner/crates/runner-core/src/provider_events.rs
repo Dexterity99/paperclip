@@ -4,7 +4,6 @@ use sha2::{Digest, Sha256};
 use crate::durable::{redact_text, EventPriority};
 
 const MAX_TEXT_CHARS: usize = 4_000;
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NormalizedProviderEvent {
@@ -59,14 +58,13 @@ fn provider_status(value: &str, completed: bool) -> &'static str {
 }
 
 fn bounded_output(value: &str) -> Value {
-    let redacted = redact_text(value);
-    let bytes = redacted.as_bytes();
-    let start = bytes.len().saturating_sub(MAX_OUTPUT_BYTES);
+    let output = redact_text(value);
+    let output_truncated = output != value;
     json!({
-        "output": String::from_utf8_lossy(&bytes[start..]),
-        "outputBytes": bytes.len(),
-        "outputTruncated": bytes.len() > MAX_OUTPUT_BYTES,
-        "outputDigest": format!("sha256:{:x}", Sha256::digest(bytes)),
+        "output": output,
+        "outputBytes": value.len(),
+        "outputTruncated": output_truncated,
+        "outputDigest": format!("sha256:{:x}", Sha256::digest(value.as_bytes())),
     })
 }
 
@@ -76,9 +74,9 @@ fn measurement(value: &Value) -> Value {
         "outputTokens": value.get("outputTokens").and_then(Value::as_u64).unwrap_or(0),
         "cacheReadTokens": value.get("cachedInputTokens").or_else(|| value.get("cacheReadTokens")).and_then(Value::as_u64).unwrap_or(0),
         "cacheWriteTokens": value.get("cacheWriteTokens").and_then(Value::as_u64).unwrap_or(0),
-        "activeSeconds": value.get("activeSeconds").and_then(Value::as_f64).unwrap_or(0.0),
+        "activeSeconds": value.get("activeSeconds").and_then(Value::as_f64).filter(|value| *value >= 0.0).unwrap_or(0.0),
         "requests": value.get("requests").and_then(Value::as_u64).unwrap_or(0),
-        "providerCostUsd": value.get("providerCostUsd").and_then(Value::as_f64).unwrap_or(0.0),
+        "providerCostUsd": value.get("providerCostUsd").and_then(Value::as_f64).filter(|value| *value >= 0.0).unwrap_or(0.0),
     })
 }
 
@@ -183,7 +181,7 @@ pub fn normalize_codex_notification(method: &str, params: &Value) -> Vec<Normali
                 json!({
                     "schema": "paperclip.plan.updated.v1",
                     "planId": plan_id,
-                    "revision": params.get("revision").and_then(Value::as_u64).unwrap_or(1),
+                    "revision": params.get("revision").and_then(Value::as_u64).filter(|value| *value > 0).unwrap_or(1),
                     "explanation": params.get("explanation").and_then(Value::as_str).map(|value| bounded_text(value, MAX_TEXT_CHARS)),
                     "steps": steps,
                     "complete": complete,
@@ -209,8 +207,8 @@ pub fn normalize_codex_notification(method: &str, params: &Value) -> Vec<Normali
                 EventPriority::P0,
                 json!({
                     "provider": "codex",
-                    "model": params.get("model").and_then(Value::as_str),
-                    "providerSessionId": params.get("threadId").and_then(Value::as_str),
+                    "model": params.get("model").and_then(Value::as_str).map(|value| bounded_text(value, 240)),
+                    "providerSessionId": params.get("threadId").and_then(Value::as_str).map(|value| bounded_text(value, 240)),
                     "providerRequestId": Value::Null,
                     "cumulative": measurement(cumulative),
                     "runDelta": measurement(run_delta),
@@ -352,7 +350,8 @@ mod tests {
             }}),
         );
         assert_eq!(events[0].event_type, "tool.execution.completed");
-        assert_eq!(events[0].payload["outputTruncated"], false);
+        assert_eq!(events[0].payload["outputTruncated"], true);
+        assert_eq!(events[0].payload["outputBytes"], 32);
         assert!(!events[0].payload.to_string().contains("top-secret"));
     }
 

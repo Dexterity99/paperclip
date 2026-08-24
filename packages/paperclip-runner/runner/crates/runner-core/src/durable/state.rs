@@ -884,6 +884,17 @@ pub(crate) fn create_private_temporary_file(
 
 fn sensitive_key(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+    if matches!(
+        normalized.as_str(),
+        "inputtokens"
+            | "outputtokens"
+            | "cachereadtokens"
+            | "cachewritetokens"
+            | "pretokens"
+            | "posttokens"
+    ) {
+        return false;
+    }
     [
         "authorization",
         "cookie",
@@ -1126,7 +1137,7 @@ mod tests {
                 &config,
                 "runner.diagnostic",
                 EventPriority::P1,
-                json!({"nested": {"api_token": "secret-value"}}),
+                json!({"nested": {"api_token": "secret-value", "inputTokens": 42}}),
             )
             .unwrap();
         assert_eq!(
@@ -1134,6 +1145,12 @@ mod tests {
                 .envelope
                 .pointer("/payload/payload/nested/api_token"),
             Some(&Value::String("[REDACTED]".to_owned()))
+        );
+        assert_eq!(
+            state.outbox[0]
+                .envelope
+                .pointer("/payload/payload/nested/inputTokens"),
+            Some(&json!(42))
         );
     }
 

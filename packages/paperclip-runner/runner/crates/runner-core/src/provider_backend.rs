@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use std::fs::File;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -217,12 +219,15 @@ impl CodexCommandExecutor {
             ));
         }
         let (temporary, mut file) = create_private_temporary_file(&path)?;
-        let result = file
-            .write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| fs::rename(&temporary, &path))
-            .and_then(|()| File::open(&self.state_dir))
-            .and_then(|directory| directory.sync_all());
+        let result = (|| -> std::io::Result<()> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temporary, &path)?;
+            #[cfg(unix)]
+            File::open(&self.state_dir)?.sync_all()?;
+            Ok(())
+        })();
         if let Err(error) = result {
             let _ = fs::remove_file(&temporary);
             return Err(DurableRunnerError::invalid(format!(

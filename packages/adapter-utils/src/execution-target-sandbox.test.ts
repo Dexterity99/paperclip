@@ -3163,25 +3163,25 @@ describe("sandbox adapter execution targets", () => {
       const joined = openInput.command.join(" ");
       const nonce = /PAPERCLIP_BRIDGE_NONCE='([^']*)'/.exec(joined)?.[1] ?? "";
       const port = /PAPERCLIP_BRIDGE_PORT='([^']*)'/.exec(joined)?.[1] ?? "";
-      let dataListener: ((chunk: string) => void) | null = null;
+      let dataListener: ((chunk: Uint8Array) => void) | null = null;
       let exitListener: ((exit: { exitCode: number | null }) => void) | null = null;
       const channel: CommandManagedDuplexChannel = {
-        write(data: string): void {
-          const decoded = decodeDuplexLine(data.replace(/\n$/, ""));
+        write(data: Uint8Array): void {
+          const decoded = decodeDuplexLine(Buffer.from(data).toString("utf8").replace(/\n$/, ""));
           if (decoded.ok) {
             control.writtenTypes.push(decoded.frame.type);
             if (decoded.frame.type === "response") control.written.push(decoded.frame);
           }
         },
-        onData(listener: (chunk: string) => void): void {
+        onData(listener: (chunk: Uint8Array) => void): void {
           dataListener = listener;
-          control.emitData = (chunk) => dataListener?.(chunk);
+          control.emitData = (chunk) => dataListener?.(new TextEncoder().encode(chunk));
           // Drive the readiness emission on the next tick, after the gate also
           // registers its exit listener.
           setImmediate(() => {
-            const emitRaw = (text: string) => dataListener?.(text);
+            const emitRaw = (text: string) => dataListener?.(new TextEncoder().encode(text));
             const emitFrame = (frame: Record<string, unknown>) =>
-              dataListener?.(`${JSON.stringify(frame)}\n`);
+              dataListener?.(new TextEncoder().encode(`${JSON.stringify(frame)}\n`));
             const emitExit = (exit: { exitCode: number | null }) => exitListener?.(exit);
             if (onOpen) {
               onOpen({ nonce, port, emitRaw, emitFrame, emitExit });
@@ -4234,16 +4234,18 @@ describe("sandbox adapter execution targets", () => {
     }): Promise<CommandManagedDuplexChannel> => {
       const joined = openInput.command.join(" ");
       const nonce = /PAPERCLIP_BRIDGE_NONCE='([^']*)'/.exec(joined)?.[1] ?? "";
-      let dataListener: ((chunk: string) => void) | null = null;
+      let dataListener: ((chunk: Uint8Array) => void) | null = null;
       const channel: CommandManagedDuplexChannel = {
-        write(_data: string): void {
+        write(_data: Uint8Array): void {
           // Every response write fails with a provider error carrying the sentinel.
           throw new Error(`provider write failed: ${PROVIDER_ERROR_SENTINEL}`);
         },
-        onData(listener: (chunk: string) => void): void {
+        onData(listener: (chunk: Uint8Array) => void): void {
           dataListener = listener;
-          control.emitData = (chunk) => dataListener?.(chunk);
-          setImmediate(() => dataListener?.(`${JSON.stringify({ version: 2, type: "ready", nonce })}\n`));
+          control.emitData = (chunk) => dataListener?.(new TextEncoder().encode(chunk));
+          setImmediate(() =>
+            dataListener?.(new TextEncoder().encode(`${JSON.stringify({ version: 2, type: "ready", nonce })}\n`)),
+          );
         },
         onExit(_listener: (exit: { exitCode: number | null }) => void): void {},
         stop(): void {},
@@ -5995,7 +5997,7 @@ function createFakeDuplexChannel(): {
   setWriteError: (error: Error | null) => void;
   setCloseBehavior: (behavior: "resolve" | "hang" | "reject") => void;
 } {
-  let dataListener: ((chunk: string) => void) | null = null;
+  let dataListener: ((chunk: Uint8Array) => void) | null = null;
   let exitListener: ((exit: { exitCode: number | null }) => void) | null = null;
   let writeError: Error | null = null;
   let closeBehavior: "resolve" | "hang" | "reject" = "resolve";
@@ -6012,9 +6014,9 @@ function createFakeDuplexChannel(): {
   >();
 
   const channel: CommandManagedDuplexChannel = {
-    write(data: string): void {
+    write(data: Uint8Array): void {
       if (writeError) throw writeError;
-      const decoded = decodeDuplexLine(data.replace(/\n$/, ""));
+      const decoded = decodeDuplexLine(Buffer.from(data).toString("utf8").replace(/\n$/, ""));
       if (!decoded.ok) return;
       const frame = decoded.frame;
       writtenTypes.push(frame.type);
@@ -6039,7 +6041,7 @@ function createFakeDuplexChannel(): {
         }
       }
     },
-    onData(listener: (chunk: string) => void): void {
+    onData(listener: (chunk: Uint8Array) => void): void {
       dataListener = listener;
     },
     onExit(listener: (exit: { exitCode: number | null }) => void): void {
@@ -6057,7 +6059,7 @@ function createFakeDuplexChannel(): {
 
   return {
     channel,
-    emitData: (chunk: string) => dataListener?.(chunk),
+    emitData: (chunk: string) => dataListener?.(new TextEncoder().encode(chunk)),
     emitExit: (exit: { exitCode: number | null }) => exitListener?.(exit),
     written,
     writtenTypes,
@@ -6707,20 +6709,20 @@ describe("duplex readiness gate replay-buffer reservation", () => {
       emitExit: (exit: { exitCode: number | null }) => void;
     };
   } {
-    let dataListener: ((chunk: string) => void) | null = null;
+    let dataListener: ((chunk: Uint8Array) => void) | null = null;
     let exitListener: ((exit: { exitCode: number | null }) => void) | null = null;
     const control = {
       stopCount: 0,
       closeCount: 0,
       written: [] as string[],
-      emitData: (chunk: string): void => dataListener?.(chunk),
+      emitData: (chunk: string): void => dataListener?.(new TextEncoder().encode(chunk)),
       emitExit: (exit: { exitCode: number | null }): void => exitListener?.(exit),
     };
     const channel: CommandManagedDuplexChannel = {
-      write(data: string): void {
-        control.written.push(data);
+      write(data: Uint8Array): void {
+        control.written.push(Buffer.from(data).toString("utf8"));
       },
-      onData(listener: (chunk: string) => void): void {
+      onData(listener: (chunk: Uint8Array) => void): void {
         dataListener = listener;
       },
       onExit(listener: (exit: { exitCode: number | null }) => void): void {
@@ -6784,7 +6786,7 @@ describe("duplex readiness gate replay-buffer reservation", () => {
     // The broker binds and replays the suffix; the gate releases the token after
     // the synchronous handoff.
     const replayed: string[] = [];
-    gate.brokerChannel.onData((chunk) => replayed.push(chunk));
+    gate.brokerChannel.onData((chunk) => replayed.push(Buffer.from(chunk).toString("utf8")));
     expect(replayed).toEqual([suffix]);
     expect(ledger.bytesInUse).toBe(0);
     expect(ledger.liveTokenCount).toBe(0);
@@ -6833,7 +6835,7 @@ describe("duplex readiness gate replay-buffer reservation", () => {
     // reservation.
     const replayed: string[] = [];
     const exits: Array<{ exitCode: number | null }> = [];
-    gate.brokerChannel.onData((chunk) => replayed.push(chunk));
+    gate.brokerChannel.onData((chunk) => replayed.push(Buffer.from(chunk).toString("utf8")));
     gate.brokerChannel.onExit((exit) => exits.push(exit));
     expect(replayed).toEqual([suffix]);
     expect(exits).toEqual([{ exitCode: 0 }]);
@@ -6866,7 +6868,7 @@ describe("duplex readiness gate replay-buffer reservation", () => {
     expect(counts.underflows).toBe(0);
     // Binding the broker replays nothing, because the gate dropped the buffer.
     const replayed: string[] = [];
-    gate.brokerChannel.onData((chunk) => replayed.push(chunk));
+    gate.brokerChannel.onData((chunk) => replayed.push(Buffer.from(chunk).toString("utf8")));
     expect(replayed).toEqual([]);
   });
 
@@ -6893,7 +6895,7 @@ describe("duplex readiness gate replay-buffer reservation", () => {
     expect(ledger.liveTokenCount).toBe(1);
     // The broker binds, replays the suffix, and the gate releases the token.
     const replayed: string[] = [];
-    gate.brokerChannel.onData((chunk) => replayed.push(chunk));
+    gate.brokerChannel.onData((chunk) => replayed.push(Buffer.from(chunk).toString("utf8")));
     expect(replayed).toEqual([suffix]);
     expect(ledger.bytesInUse).toBe(0);
     expect(gate.retainedReadinessBufferLength()).toBe(0);

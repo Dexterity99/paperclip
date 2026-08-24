@@ -1137,10 +1137,10 @@ function adaptDuplexChannelHostSession(
   session: DuplexChannelHostSession,
 ): CommandManagedDuplexChannel {
   return {
-    write(data: string): void {
+    write(data: Uint8Array): void {
       session.write(data);
     },
-    onData(listener: (chunk: string) => void): void {
+    onData(listener: (chunk: Uint8Array) => void): void {
       session.onData(listener);
     },
     onExit(listener: (exit: { exitCode: number | null; transportClosed?: boolean }) => void): void {

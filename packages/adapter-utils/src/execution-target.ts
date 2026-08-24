@@ -2602,21 +2602,27 @@ async function ensureSandboxRunLogDirectory(input: {
  * and before it decodes a candidate line, so an over-cap prefix never reaches READY
  * acceptance. The cap check has priority over READY acceptance on every path.
  */
-// The count of the pre-READY newline-scan work, in UTF-16 code units. Each
-// search adds the number of code units it can read. A test reads this count to
-// prove the scan work stays linear in the bytes received. Production code never
-// reads this count.
+// The count of the pre-READY newline-scan work, in bytes. Each search adds the
+// number of bytes it can read. A test reads this count to prove the scan work
+// stays linear in the bytes received. Production code never reads this count.
 let duplexReadinessNewlineScanUnits = 0;
+
+/** The newline byte. The readiness buffer is a byte buffer, not a string. */
+const READINESS_NEWLINE_BYTE = 0x0a;
+/** The opening-brace byte. The bracketed-paste retry scans for it, not a string. */
+const READINESS_OPEN_BRACE_BYTE = 0x7b;
+/** The one shared empty buffer. The gate starts and resets `buffer` to it. */
+const READINESS_EMPTY_BUFFER = Buffer.alloc(0);
 
 /**
  * Find the first newline in `buffer` at or after index `from` and return its
- * index, or -1. `String#indexOf` reads the code units from `from` up to the
- * newline it finds, or to the end of the buffer when it finds none. This helper
- * counts that real scan distance for a test. The count stays linear in the bytes
+ * index, or -1. `Buffer#indexOf` reads the bytes from `from` up to the newline
+ * it finds, or to the end of the buffer when it finds none. This helper counts
+ * that real scan distance for a test. The count stays linear in the bytes
  * received when the caller advances `from` past each newline it consumes.
  */
-function findNewlineFrom(buffer: string, from: number): number {
-  const newlineIndex = buffer.indexOf("\n", from);
+function findNewlineFrom(buffer: Buffer, from: number): number {
+  const newlineIndex = buffer.indexOf(READINESS_NEWLINE_BYTE, from);
   const scanned = newlineIndex === -1 ? buffer.length - from : newlineIndex - from + 1;
   duplexReadinessNewlineScanUnits += scanned;
   return newlineIndex;
@@ -2668,8 +2674,8 @@ interface DuplexReadinessGate {
    */
   disposePendingReplay(): void;
   /**
-   * Test-only. Report the length of the retained pre-READY buffer, in UTF-16 code
-   * units. A test reads this to prove the gate drops the pre-READY buffer on READY
+   * Test-only. Report the length of the retained pre-READY buffer, in bytes. A
+   * test reads this to prove the gate drops the pre-READY buffer on READY
    * acceptance, so the process does not retain the sandbox-controlled prefix.
    * Production code does not read this.
    */
@@ -2729,18 +2735,18 @@ function createDuplexReadinessGate(
   }
   // The raw bytes the host reads before the READY frame completes. The buffer is
   // append-only, so the O(1) cap check on `buffer.length` stays valid.
-  let buffer = "";
+  let buffer: Buffer = READINESS_EMPTY_BUFFER;
   // The start index of the current line in `buffer`. A leading blank line
   // advances this cursor past its newline without a buffer copy.
   let lineStart = 0;
   // The next index to search for a newline. The gate scans from here, so each
-  // code unit is read at most one time for the newline search.
+  // byte is read at most one time for the newline search.
   let scanFrom = 0;
   // The bytes that followed the READY frame, held until the broker binds.
-  let pending = "";
+  let pending: Uint8Array = READINESS_EMPTY_BUFFER;
   // The exit that arrived after READY but before the broker bound, if any.
   let pendingExit: { exitCode: number | null } | null = null;
-  let dataSink: ((chunk: string) => void) | null = null;
+  let dataSink: ((chunk: Uint8Array) => void) | null = null;
   let exitSink: ((exit: { exitCode: number | null }) => void) | null = null;
   let resolveReady!: (result: DuplexReadinessResult) => void;
   const ready = new Promise<DuplexReadinessResult>((resolve) => {
@@ -2777,17 +2783,20 @@ function createDuplexReadinessGate(
       // with the aggregate marker, because `ready` already resolved before this
       // synchronous post-READY chunk arrived.
       if (ledger) {
-        const token = ledger.reserve("readiness_replay", Buffer.byteLength(chunk, "utf8"));
+        const token = ledger.reserve("readiness_replay", chunk.byteLength);
         if (!token) {
           replayOverflow = true;
-          pending = "";
+          pending = READINESS_EMPTY_BUFFER;
           releaseReplayTokens();
           channel.stop();
           return;
         }
         replayTokens.push(token);
       }
-      pending += chunk;
+      // Copy a first chunk instead of aliasing the caller's `Uint8Array`, so a
+      // channel that reuses its delivered buffer across calls cannot corrupt the
+      // bytes this gate holds for the broker replay.
+      pending = pending.length === 0 ? Buffer.from(chunk) : Buffer.concat([pending, chunk]);
       return;
     }
     if (settled) {
@@ -2796,12 +2805,12 @@ function createDuplexReadinessGate(
       // never grows the buffer after the gate settles.
       return;
     }
-    // Reserve the exact UTF-8 bytes of this chunk against the aggregate ledger
-    // before the gate retains it. The pre-READY buffer holds untrusted bytes, so
-    // a flood counts toward the process aggregate ceiling. A rejection fails
+    // Reserve the exact bytes of this chunk against the aggregate ledger before
+    // the gate retains it. The pre-READY buffer holds untrusted bytes, so a
+    // flood counts toward the process aggregate ceiling. A rejection fails
     // closed: the gate retains nothing more and falls back to the file bridge.
     if (ledger) {
-      const token = ledger.reserve("readiness_buffer", Buffer.byteLength(chunk, "utf8"));
+      const token = ledger.reserve("readiness_buffer", chunk.byteLength);
       if (!token) {
         finish({ ok: false, reason: "aggregate_bytes_exceeded" });
         return;
@@ -2809,9 +2818,9 @@ function createDuplexReadinessGate(
       retainedTokens.push(token);
     }
     // Append the new bytes and continue the newline search from `scanFrom`, the
-    // first index not yet examined. Each code unit is read at most one time for
-    // the search, so the total scan work stays linear in the bytes received.
-    buffer += chunk;
+    // first index not yet examined. Each byte is read at most one time for the
+    // search, so the total scan work stays linear in the bytes received.
+    buffer = buffer.length === 0 ? Buffer.from(chunk) : Buffer.concat([buffer, chunk]);
     for (;;) {
       const newlineIndex = findNewlineFrom(buffer, scanFrom);
       if (newlineIndex === -1) {
@@ -2822,13 +2831,8 @@ function createDuplexReadinessGate(
         // READY frame, so finish with protocol contamination. The retained
         // skipped lines count against the cap; that is acceptable and fail-closed.
         //
-        // Gate on buffer.length, the UTF-16 code-unit count, which is O(1).
-        // Buffer.byteLength is O(n), so a byte check on every newline-less chunk
-        // makes the pre-READY window quadratic in the bytes received. The UTF-8
-        // byte length is greater than or equal to the UTF-16 code-unit count for
-        // every string, so this check never fires before the byte cap is truly
-        // exceeded. It can fire late by at most a factor of 3, so peak buffer
-        // memory stays bounded near 3 MB.
+        // `buffer` is a byte buffer, so `buffer.length` is the exact byte count,
+        // read in O(1).
         if (buffer.length > DUPLEX_READINESS_BUFFER_CAP_BYTES) {
           finish({ ok: false, reason: "protocol_contamination" });
         }
@@ -2869,7 +2873,7 @@ function createDuplexReadinessGate(
         // strict decode over the remainder of the line, and readiness still
         // authenticates on the nonce below, so a prefix cannot forge a frame or
         // smuggle a second one — it can only be discarded.
-        const braceIndex = line.indexOf("{");
+        const braceIndex = line.indexOf(READINESS_OPEN_BRACE_BYTE);
         if (braceIndex > 0) {
           decoded = decodeDuplexLine(line.slice(braceIndex));
         }
@@ -2895,10 +2899,10 @@ function createDuplexReadinessGate(
         // only the suffix, so aggregate retention passes the ceiling. This clear
         // also covers the broker handoff and the replay disposal. Both run later
         // and read no buffer bytes.
-        buffer = "";
+        buffer = READINESS_EMPTY_BUFFER;
         releaseReadinessBufferTokens();
         if (ledger && suffix.length > 0) {
-          const token = ledger.reserve("readiness_replay", Buffer.byteLength(suffix, "utf8"));
+          const token = ledger.reserve("readiness_replay", suffix.byteLength);
           if (!token) {
             // The retained suffix passes the aggregate ceiling. Fail closed: drop
             // the suffix and fall back to the file bridge with the aggregate marker.
@@ -2939,12 +2943,12 @@ function createDuplexReadinessGate(
   });
 
   const brokerChannel: CommandManagedDuplexChannel = {
-    write: (data: string) => channel.write(data),
-    onData: (listener: (chunk: string) => void) => {
+    write: (data: Uint8Array) => channel.write(data),
+    onData: (listener: (chunk: Uint8Array) => void) => {
       dataSink = listener;
       if (pending.length > 0) {
         const replay = pending;
-        pending = "";
+        pending = READINESS_EMPTY_BUFFER;
         listener(replay);
       }
       // Release every readiness-replay token exactly once, after the synchronous
@@ -2970,7 +2974,7 @@ function createDuplexReadinessGate(
     brokerChannel,
     replayOverflowed: () => replayOverflow,
     disposePendingReplay: () => {
-      pending = "";
+      pending = READINESS_EMPTY_BUFFER;
       releaseReplayTokens();
     },
     retainedReadinessBufferLength: () => buffer.length,

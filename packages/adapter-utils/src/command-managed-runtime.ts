@@ -37,9 +37,9 @@ export interface DuplexChannelOpenInput {
  */
 export interface CommandManagedDuplexChannel {
   /** Writes raw input bytes to the channel. */
-  write(data: string): void;
-  /** Registers the one data listener. The channel streams each raw chunk in order. */
-  onData(listener: (chunk: string) => void): void;
+  write(data: Uint8Array): void;
+  /** Registers the one data listener. The channel streams each raw byte chunk in order. */
+  onData(listener: (chunk: Uint8Array) => void): void;
   /**
    * Registers the one exit listener. The channel calls it one time with the exit.
    * A numeric `exitCode` is a real process exit. `transportClosed` is true when the

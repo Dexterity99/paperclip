@@ -300,10 +300,8 @@ fn poll_executor_events<E: CommandExecutor>(
         // Commit and acknowledge one event at a time. If a later event is
         // oversized or the outbox is full, the accepted prefix is already
         // durable and the unacknowledged suffix remains with the executor.
-        let mut next_state = state.clone();
-        next_state.enqueue_event(config, event_type, priority, payload)?;
-        store.save(&next_state)?;
-        *state = next_state;
+        state.enqueue_event(config, event_type, priority, payload)?;
+        store.save(state)?;
         executor.acknowledge_events(1)?;
     }
     Ok(())

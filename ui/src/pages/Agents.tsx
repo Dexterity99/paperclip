@@ -110,6 +110,57 @@ function getConfiguredModel(agent: Agent): string | null {
   return model.length > 0 ? model : null;
 }
 
+function getFeaturedRosterAgents(agents: Agent[]): Agent[] {
+  return agents
+    .filter((agent) => {
+      if (HIDDEN_AGENT_STATUSES.has(agent.status)) return false;
+      return agent.metadata?.rosterSurface === true;
+    })
+    .sort((a, b) => {
+      const aOrder = typeof a.metadata?.rosterOrder === "number"
+        ? a.metadata.rosterOrder
+        : Number.MAX_SAFE_INTEGER;
+      const bOrder = typeof b.metadata?.rosterOrder === "number"
+        ? b.metadata.rosterOrder
+        : Number.MAX_SAFE_INTEGER;
+      return aOrder - bOrder || a.name.localeCompare(b.name);
+    });
+}
+
+function FeaturedAgentRoster({ agents }: { agents: Agent[] }) {
+  if (agents.length === 0) return null;
+
+  return (
+    <section className="rounded-lg border border-border bg-card p-4" aria-labelledby="featured-roster-heading">
+      <div className="mb-3">
+        <h2 id="featured-roster-heading" className="text-sm font-medium text-foreground">
+          Featured roster
+        </h2>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          Primary operational groups and runtime owners.
+        </p>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        {agents.map((agent) => (
+          <Link
+            key={agent.id}
+            to={agentUrl(agent)}
+            className="flex min-w-0 items-center justify-between gap-3 rounded-md border border-border bg-background px-3 py-2 transition-colors hover:bg-accent/50"
+          >
+            <span className="min-w-0">
+              <span className="block truncate text-sm font-medium text-foreground">{agent.name}</span>
+              <span className="block truncate text-xs text-muted-foreground">
+                {roleLabels[agent.role] ?? agent.role}
+              </span>
+            </span>
+            <AgentStatusBadge status={agent.status} />
+          </Link>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function formatEnvironmentDriver(driver: Environment["driver"]): string {
   if (driver === "ssh") return "SSH";
   return driver.charAt(0).toUpperCase() + driver.slice(1);
@@ -337,6 +388,7 @@ export function Agents() {
 
   const filtered = filterAgents(agents ?? [], tab, builtInAgentIds);
   const filteredOrg = filterOrgTree(orgTree ?? [], tab, builtInAgentIds);
+  const featuredRoster = tab === "all" ? getFeaturedRosterAgents(agents ?? []) : [];
   const environmentDataLoading = environmentsEnabled && environments === undefined;
   const showEnvironmentColumn = environmentsEnabled && (environments === undefined || environments.length > 1);
   const resolveRenderedEnvironment = (agentId: string) => (
@@ -547,6 +599,8 @@ export function Agents() {
       )}
 
       {error && <p className="text-sm text-destructive">{error.message}</p>}
+
+      <FeaturedAgentRoster agents={featuredRoster} />
 
       {agents && agents.length === 0 && (
         <EmptyState

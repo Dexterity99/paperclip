@@ -384,6 +384,50 @@ describe("Agents", () => {
     expect(heartbeatCell?.textContent).not.toContain("\n");
   });
 
+  it("renders and orders the featured roster from agent metadata", async () => {
+    mockAgentsApi.list.mockResolvedValue([
+      makeAgent({
+        id: "runtime-owner",
+        name: "Runtime Owner",
+        urlKey: "runtime-owner",
+        metadata: { rosterSurface: true, rosterOrder: 20 },
+      }),
+      makeAgent({
+        id: "publishing-team",
+        name: "Publishing Team",
+        urlKey: "publishing-team",
+        metadata: { rosterSurface: true, rosterOrder: 10 },
+      }),
+      makeAgent({
+        id: "supporting-agent",
+        name: "Supporting Agent",
+        urlKey: "supporting-agent",
+      }),
+    ]);
+
+    root = createRoot(container);
+    await act(async () => {
+      root!.render(
+        <QueryClientProvider client={queryClient}>
+          <ToastProvider>
+            <Agents />
+          </ToastProvider>
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const roster = container.querySelector("[aria-labelledby='featured-roster-heading']");
+    expect(roster).not.toBeNull();
+    expect(roster?.textContent).toContain("Publishing Team");
+    expect(roster?.textContent).toContain("Runtime Owner");
+    expect(roster?.textContent).not.toContain("Supporting Agent");
+    expect(roster?.textContent?.indexOf("Publishing Team")).toBeLessThan(
+      roster?.textContent?.indexOf("Runtime Owner") ?? 0,
+    );
+  });
+
   it("gives mobile agent names the full row width after the leading status indicator", async () => {
     mockSidebarState.isMobile = true;
     mockResourceMembershipsApi.listMine.mockResolvedValue({

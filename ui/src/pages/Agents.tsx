@@ -109,6 +109,41 @@ function getConfiguredModel(agent: Agent): string | null {
   return model.length > 0 ? model : null;
 }
 
+const rosterNames = new Set(["Titan", "Atlas", "BookForge Agents", "Governance and Status Roles"]);
+
+function getRosterAgents(agents: Agent[]): Agent[] {
+  const order = ["Titan", "Atlas", "BookForge Agents", "Governance and Status Roles"];
+  return agents
+    .filter((agent) => rosterNames.has(agent.name))
+    .sort((a, b) => order.indexOf(a.name) - order.indexOf(b.name));
+}
+
+function AgentRosterSurface({ agents }: { agents: Agent[] }) {
+  return (
+    <section className="border border-border bg-card/50 p-3" aria-label="Agent roster surface">
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <p className="text-xs uppercase tracking-wide text-muted-foreground">Agent roster</p>
+          <h2 className="text-sm font-semibold">Operating roles surfaced for status and routing</h2>
+        </div>
+        <p className="text-xs text-muted-foreground">Live employees from Paperclip agents</p>
+      </div>
+      <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        {agents.map((agent) => (
+          <Link key={agent.id} to={agentUrl(agent)} className="border border-border bg-background/60 px-3 py-2 no-underline text-inherit transition-colors hover:bg-accent/30">
+            <div className="flex items-center justify-between gap-2">
+              <span className="truncate text-sm font-medium">{agent.name}</span>
+              <StatusBadge status={agent.status} />
+            </div>
+            <p className="mt-1 truncate text-xs text-muted-foreground">{agent.title ?? roleLabels[agent.role] ?? agent.role}</p>
+            <p className="mt-2 text-[11px] text-muted-foreground">Route: {agentRouteRef(agent)}</p>
+          </Link>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function formatEnvironmentDriver(driver: Environment["driver"]): string {
   if (driver === "ssh") return "SSH";
   return driver.charAt(0).toUpperCase() + driver.slice(1);
@@ -291,6 +326,8 @@ export function Agents() {
     for (const a of agents ?? []) map.set(a.id, a);
     return map;
   }, [agents]);
+
+  const rosterAgents = useMemo(() => getRosterAgents(agents ?? []), [agents]);
 
   const environmentsById = useMemo(() => {
     const map = new Map<string, Environment>();
@@ -544,6 +581,8 @@ export function Agents() {
       )}
 
       {error && <p className="text-sm text-destructive">{error.message}</p>}
+
+      {rosterAgents.length > 0 && <AgentRosterSurface agents={rosterAgents} />}
 
       {agents && agents.length === 0 && (
         <EmptyState

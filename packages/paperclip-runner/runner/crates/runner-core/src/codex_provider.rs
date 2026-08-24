@@ -368,6 +368,7 @@ impl CodexProvider {
                             "Codex reused a runtime request id with different input",
                         ));
                     }
+                    return Ok(None);
                 } else {
                     self.pending_runtime_requests
                         .insert(request_id.clone(), pending);
@@ -416,7 +417,7 @@ impl CodexProvider {
         for request in pending.into_values() {
             self.process.send(&json!({
                 "id": request.rpc_id,
-                "result": {"answers": {}, "cancelled": true},
+                "result": {"answers": {}},
             }))?;
         }
         Ok(())
@@ -641,6 +642,17 @@ fn codex_question_response(
     pending: &PendingRuntimeRequest,
     response: &Value,
 ) -> Result<Value, LocalRunnerError> {
+    let response_object = response
+        .as_object()
+        .ok_or_else(|| LocalRunnerError::invalid("runtime response must be an object"))?;
+    if response_object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "schema" | "answers"))
+    {
+        return Err(LocalRunnerError::invalid(
+            "runtime response contains an unknown top-level field",
+        ));
+    }
     if response.get("schema").and_then(Value::as_str) != Some("paperclip.question_response.v1") {
         return Err(LocalRunnerError::invalid(
             "runtime response requires paperclip.question_response.v1",
@@ -664,41 +676,70 @@ fn codex_question_response(
         let answer = answers
             .get(id)
             .ok_or_else(|| LocalRunnerError::invalid(format!("missing answer for {id}")))?;
-        let values = if let Some(custom_text) = answer
-            .get("customText")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty() && value.len() <= 4000)
+        let answer = answer.as_object().ok_or_else(|| {
+            LocalRunnerError::invalid(format!("answer for {id} must be an object"))
+        })?;
+        if answer
+            .keys()
+            .any(|key| !matches!(key.as_str(), "selectedOptionIds" | "text" | "customText"))
         {
-            if question
-                .pointer("/customAnswer/enabled")
-                .and_then(Value::as_bool)
-                != Some(true)
-            {
+            return Err(LocalRunnerError::invalid(format!(
+                "answer for {id} contains an unknown field"
+            )));
+        }
+        let selected = answer.get("selectedOptionIds");
+        let text = answer.get("text");
+        let custom = answer.get("customText");
+        let values = if question.get("answerMode").and_then(Value::as_str) == Some("single_select")
+        {
+            if text.is_some() || (selected.is_some() && custom.is_some()) {
                 return Err(LocalRunnerError::invalid(format!(
-                    "{id} does not allow a custom answer"
+                    "{id} must contain one selected option or one custom answer"
                 )));
             }
-            vec![custom_text.to_owned()]
-        } else if question.get("answerMode").and_then(Value::as_str) == Some("single_select") {
-            let selected = answer
-                .get("selectedOptionIds")
-                .and_then(Value::as_array)
-                .filter(|values| values.len() == 1)
-                .ok_or_else(|| {
-                    LocalRunnerError::invalid(format!("{id} requires one selected option"))
-                })?;
-            let option_id = selected[0]
-                .as_str()
-                .ok_or_else(|| LocalRunnerError::invalid("selected option id is invalid"))?;
-            vec![pending
-                .option_labels
-                .get(id)
-                .and_then(|labels| labels.get(option_id))
-                .cloned()
-                .ok_or_else(|| LocalRunnerError::invalid("selected option is not available"))?]
+            if let Some(custom_text) = custom {
+                if question
+                    .pointer("/customAnswer/enabled")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                {
+                    return Err(LocalRunnerError::invalid(format!(
+                        "{id} does not allow a custom answer"
+                    )));
+                }
+                vec![custom_text
+                    .as_str()
+                    .filter(|value| !value.is_empty() && value.len() <= 4000)
+                    .ok_or_else(|| {
+                        LocalRunnerError::invalid(format!(
+                            "{id} custom answer must be non-empty and bounded"
+                        ))
+                    })?
+                    .to_owned()]
+            } else {
+                let selected = selected
+                    .and_then(Value::as_array)
+                    .filter(|values| values.len() == 1)
+                    .ok_or_else(|| {
+                        LocalRunnerError::invalid(format!("{id} requires one selected option"))
+                    })?;
+                let option_id = selected[0]
+                    .as_str()
+                    .ok_or_else(|| LocalRunnerError::invalid("selected option id is invalid"))?;
+                vec![pending
+                    .option_labels
+                    .get(id)
+                    .and_then(|labels| labels.get(option_id))
+                    .cloned()
+                    .ok_or_else(|| LocalRunnerError::invalid("selected option is not available"))?]
+            }
         } else {
-            vec![answer
-                .get("text")
+            if selected.is_some() || custom.is_some() {
+                return Err(LocalRunnerError::invalid(format!(
+                    "{id} text answer cannot contain select or custom fields"
+                )));
+            }
+            vec![text
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty() && value.len() <= 4000)
                 .ok_or_else(|| LocalRunnerError::invalid(format!("{id} requires text")))?
@@ -751,6 +792,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(native["answers"]["environment"]["answers"][0], "Staging");
+        assert!(codex_question_response(
+            &pending,
+            &json!({
+                "schema": "paperclip.question_response.v1",
+                "answers": {"environment": {
+                    "selectedOptionIds": ["option-1"],
+                    "customText": "Production",
+                }},
+            }),
+        )
+        .is_err());
+        assert!(codex_question_response(
+            &pending,
+            &json!({
+                "schema": "paperclip.question_response.v1",
+                "answers": {"environment": {"selectedOptionIds": ["option-1"]}},
+                "providerEnvelope": {},
+            }),
+        )
+        .is_err());
     }
 
     #[test]

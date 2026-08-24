@@ -30,6 +30,14 @@ impl CommandExecution {
 
 pub trait CommandExecutor {
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError>;
+
+    fn poll_events(&mut self) -> Result<Vec<(String, EventPriority, Value)>, DurableRunnerError> {
+        Ok(Vec::new())
+    }
+
+    fn shutdown(&mut self) -> Result<(), DurableRunnerError> {
+        Ok(())
+    }
 }
 
 pub fn run_durable_runner<E: CommandExecutor>(
@@ -63,6 +71,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
 
     loop {
         if started.elapsed() >= config.max_runtime {
+            let _ = executor.shutdown();
             state.lifecycle = "recoverable_failure".to_owned();
             state.recoverable_failure = Some("transport_reconnect_deadline_exceeded".to_owned());
             state.record_diagnostic(
@@ -76,6 +85,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
         if lease.as_ref().is_some_and(|credential| {
             current_unix_ms().is_ok_and(|now| now >= credential.expires_at_unix_ms)
         }) {
+            let _ = executor.shutdown();
             state.lifecycle = "recoverable_failure".to_owned();
             state.recoverable_failure = Some("lease_expired_requires_bootstrap".to_owned());
             state.record_diagnostic("connection lease expired; a fresh bootstrap is required");
@@ -138,6 +148,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
             disconnected = true;
         }
         if stop_after_reply && !disconnected {
+            executor.shutdown()?;
             state.lifecycle = "stopped".to_owned();
             store.save(&state)?;
             return Ok(());
@@ -154,7 +165,15 @@ pub fn run_durable_runner<E: CommandExecutor>(
             if started.elapsed() >= config.max_runtime {
                 break;
             }
+            poll_executor_events(&mut state, &store, &config, &mut executor)?;
+            if let Err(error) = send_outbox(&mut transport, &state, &mut sent_source_seq) {
+                state.record_diagnostic(error.to_string());
+                state.reconnect_count = state.reconnect_count.saturating_add(1);
+                store.save(&state)?;
+                break;
+            }
             if current_unix_ms()? >= connection.expires_at_unix_ms {
+                let _ = executor.shutdown();
                 state.lifecycle = "recoverable_failure".to_owned();
                 state.recoverable_failure = Some("lease_expired_requires_bootstrap".to_owned());
                 state.record_diagnostic("active connection lease expired");
@@ -210,6 +229,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                         break;
                     }
                     if stop {
+                        executor.shutdown()?;
                         state.lifecycle = "stopped".to_owned();
                         store.save(&state)?;
                         return Ok(());
@@ -229,6 +249,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                     }
                     state.lifecycle = "revoked".to_owned();
                     state.record_diagnostic("connection capability was revoked");
+                    executor.shutdown()?;
                     store.save(&state)?;
                     return Ok(());
                 }
@@ -258,6 +279,22 @@ pub fn run_durable_runner<E: CommandExecutor>(
     }
 }
 
+fn poll_executor_events<E: CommandExecutor>(
+    state: &mut DurableState,
+    store: &DurableStateStore,
+    config: &DurableRunnerConfig,
+    executor: &mut E,
+) -> Result<(), DurableRunnerError> {
+    let events = executor.poll_events()?;
+    if events.is_empty() {
+        return Ok(());
+    }
+    for (event_type, priority, payload) in events {
+        state.enqueue_event(config, event_type, priority, payload)?;
+    }
+    store.save(state)
+}
+
 fn process_command<E: CommandExecutor>(
     state: &mut DurableState,
     store: &DurableStateStore,
@@ -266,7 +303,15 @@ fn process_command<E: CommandExecutor>(
     command: &Command,
 ) -> Result<(StoredCommandResult, bool), DurableRunnerError> {
     match state.begin_command(command)? {
-        CommandDisposition::Replay(result) | CommandDisposition::Reject(result) => {
+        CommandDisposition::Replay(result) => {
+            let stop = result.status == "completed"
+                && matches!(
+                    command.command_type.as_str(),
+                    "runner.shutdown" | "runner.suspend"
+                );
+            return Ok((result, stop));
+        }
+        CommandDisposition::Reject(result) => {
             return Ok((result, false));
         }
         CommandDisposition::Execute => {}
@@ -379,12 +424,12 @@ mod tests {
         }
     }
 
-    fn command() -> Command {
+    fn command(command_type: &str) -> Command {
         Command {
             schema: "paperclip.prp.command.v1".to_owned(),
             command_id: "command_1".to_owned(),
             controller_seq: 1,
-            command_type: "session.open".to_owned(),
+            command_type: command_type.to_owned(),
             issued_at: "2026-08-24T00:00:00.000Z".to_owned(),
             deadline_at: None,
             precondition: None,
@@ -403,14 +448,39 @@ mod tests {
         let store = DurableStateStore::new(&directory).unwrap();
         let (mut state, _) = store.load_or_create(&config).unwrap();
         let mut executor = CountingExecutor { calls: 0 };
-        let first = process_command(&mut state, &store, &config, &mut executor, &command())
+        let command = command("session.open");
+        let first = process_command(&mut state, &store, &config, &mut executor, &command)
             .unwrap()
             .0;
-        let replay = process_command(&mut state, &store, &config, &mut executor, &command())
+        let replay = process_command(&mut state, &store, &config, &mut executor, &command)
             .unwrap()
             .0;
         assert_eq!(executor.calls, 1);
         assert_eq!(first, replay);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn completed_shutdown_replay_still_stops_after_delivery() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-shutdown-replay-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let config = config(directory.clone());
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let mut executor = CountingExecutor { calls: 0 };
+        let command = command("runner.shutdown");
+
+        let (_, first_stop) =
+            process_command(&mut state, &store, &config, &mut executor, &command).unwrap();
+        let (_, replay_stop) =
+            process_command(&mut state, &store, &config, &mut executor, &command).unwrap();
+
+        assert!(first_stop);
+        assert!(replay_stop);
+        assert_eq!(executor.calls, 1);
         fs::remove_dir_all(directory).unwrap();
     }
 }

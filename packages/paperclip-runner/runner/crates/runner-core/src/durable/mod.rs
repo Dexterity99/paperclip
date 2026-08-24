@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub use runner::{run_durable_runner, CommandExecution, CommandExecutor};
+pub(crate) use state::{
+    create_private_temporary_file, open_private_regular_file, redact_text, verify_private_directory,
+};
 pub use state::{
     Command, CommandDisposition, DurableState, DurableStateStore, EventPriority,
     StoredCommandResult, StoredOutboxEvent,

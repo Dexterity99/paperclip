@@ -790,7 +790,7 @@ fn validate_binding(
     Ok(())
 }
 
-fn verify_private_directory(path: &Path) -> Result<(), DurableRunnerError> {
+pub(crate) fn verify_private_directory(path: &Path) -> Result<(), DurableRunnerError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -807,7 +807,7 @@ fn verify_private_directory(path: &Path) -> Result<(), DurableRunnerError> {
     Ok(())
 }
 
-fn open_private_regular_file(path: &Path) -> io::Result<File> {
+pub(crate) fn open_private_regular_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -854,7 +854,9 @@ const fn no_follow_flag() -> i32 {
     0
 }
 
-fn create_private_temporary_file(path: &Path) -> Result<(PathBuf, File), DurableRunnerError> {
+pub(crate) fn create_private_temporary_file(
+    path: &Path,
+) -> Result<(PathBuf, File), DurableRunnerError> {
     let parent = path
         .parent()
         .ok_or_else(|| DurableRunnerError::invalid("durable state path has no parent"))?;
@@ -919,7 +921,7 @@ fn sanitize_value(value: &Value) -> Value {
     }
 }
 
-fn redact_text(input: &str) -> String {
+pub(crate) fn redact_text(input: &str) -> String {
     let (bounded, truncated) = if input.len() > 4096 {
         let boundary = input
             .char_indices()

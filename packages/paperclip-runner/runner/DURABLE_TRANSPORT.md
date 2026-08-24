@@ -1,8 +1,8 @@
 # Durable PRP transport
 
 This layer gives `paperclip-runnerd` a provider-neutral, package-local PRP v1
-transport. Nothing in the Paperclip server invokes the durable mode yet, and no
-provider is installed by this change.
+transport. Nothing in the Paperclip server invokes the durable mode yet. Codex
+is the only installed provider; other providers remain unavailable.
 
 ## Trust boundary
 
@@ -49,7 +49,8 @@ P0 reserve is an explicit unrecoverable condition.
 ## Current boundary
 
 Durable mode is selected only when `paperclip-runnerd` receives
-`--connect-url`. Its transport-only executor handles runner lifecycle commands
-and rejects provider commands with `provider_not_installed`. The existing local
-fake-runner mode remains unchanged. Codex execution, semantic tools, server
-coordination, and the user-facing adapter belong to later layers.
+`--connect-url`. Its executor accepts a Codex app-server descriptor through
+`run.prepare`, owns the provider process group, resumes the persisted Codex
+thread after runner restart, and translates provider notifications to PRP
+events. The existing local fake-runner mode remains unchanged. Semantic tools,
+server coordination, and the user-facing adapter belong to later layers.

@@ -310,9 +310,8 @@ fn poll_executor_events<E: CommandExecutor>(
         // Commit and acknowledge one event at a time. If a later event is
         // oversized or the outbox is full, the accepted prefix is already
         // durable and the unacknowledged suffix remains with the executor.
-        let source_event_id = state.source_event_id_for_executor(&event.executor_event_id)?;
-        if state.matches_queued_source_event(
-            &source_event_id,
+        if state.has_executor_event_receipt(
+            &event.executor_event_id,
             &event.event_type,
             event.priority,
             &event.payload,
@@ -320,9 +319,9 @@ fn poll_executor_events<E: CommandExecutor>(
             executor.acknowledge_events(1)?;
             continue;
         }
-        state.enqueue_event_with_source_event_id(
+        state.enqueue_executor_event(
             config,
-            source_event_id,
+            event.executor_event_id,
             event.event_type,
             event.priority,
             event.payload,
@@ -553,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_acknowledges_an_event_already_in_the_outbox_without_duplication() {
+    fn receipt_survives_outbox_ack_and_prevents_duplicate_delivery() {
         let directory = std::env::temp_dir().join(format!(
             "paperclip-runner-event-ack-crash-{}",
             std::process::id()
@@ -579,10 +578,14 @@ mod tests {
             .contains("before provider acknowledgement"));
         assert_eq!(state.outbox.len(), 1);
         assert_eq!(executor.events.len(), 1);
-        let source_event_id = state.outbox[0].envelope["payload"]["sourceEventId"].clone();
+        state
+            .apply_ack(1)
+            .expect("controller ACK removes the durable outbox copy");
+        store.save(&state).unwrap();
 
         let (mut recovered_state, recovered) = store.load_or_create(&config).unwrap();
         assert!(recovered);
+        assert!(recovered_state.outbox.is_empty());
         executor.fail_acknowledgement = false;
         executor.events[0].payload = json!({"message": "different data"});
         let mismatch = poll_executor_events(&mut recovered_state, &store, &config, &mut executor)
@@ -592,11 +595,7 @@ mod tests {
         poll_executor_events(&mut recovered_state, &store, &config, &mut executor)
             .expect("recovery acknowledges the retained provider copy");
         assert!(executor.events.is_empty());
-        assert_eq!(recovered_state.outbox.len(), 1);
-        assert_eq!(
-            recovered_state.outbox[0].envelope["payload"]["sourceEventId"],
-            source_event_id
-        );
+        assert!(recovered_state.outbox.is_empty());
         assert_eq!(recovered_state.highest_source_seq(), 1);
         fs::remove_dir_all(directory).unwrap();
     }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ const STATE_FILE: &str = "runner-state.json";
 const MAX_RECENT_COMMANDS: usize = 128;
 const MAX_DIAGNOSTICS: usize = 32;
 const MAX_COMMAND_RESULT_BYTES: usize = 64 * 1024;
+const MAX_EXECUTOR_EVENT_RECEIPTS: usize = 256;
 const STATE_OVERHEAD_BYTES: usize = 16 * 1024 * 1024;
 const TEMP_FILE_ATTEMPTS: usize = 32;
 
@@ -150,6 +151,13 @@ pub struct StoredCommandResult {
     pub result: Value,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecutorEventReceipt {
+    fingerprint: String,
+    source_seq: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandDisposition {
     Execute,
@@ -180,6 +188,8 @@ pub struct DurableState {
     pub processed_commands: BTreeMap<String, StoredCommandResult>,
     #[serde(default)]
     pub processed_command_fingerprints: BTreeMap<String, String>,
+    #[serde(default)]
+    executor_event_receipts: BTreeMap<String, ExecutorEventReceipt>,
     pub diagnostics: Vec<String>,
     pub backpressure: bool,
     pub recoverable_failure: Option<String>,
@@ -207,6 +217,7 @@ impl DurableState {
             outbox: Vec::new(),
             processed_commands: BTreeMap::new(),
             processed_command_fingerprints: BTreeMap::new(),
+            executor_event_receipts: BTreeMap::new(),
             diagnostics: Vec::new(),
             backpressure: false,
             recoverable_failure: None,
@@ -241,7 +252,7 @@ impl DurableState {
         )
     }
 
-    pub(crate) fn source_event_id_for_executor(
+    fn source_event_id_for_executor(
         &self,
         executor_event_id: &str,
     ) -> Result<String, DurableRunnerError> {
@@ -261,7 +272,7 @@ impl DurableState {
         Ok(format!("event_executor_{:x}", hasher.finalize()))
     }
 
-    pub(crate) fn has_source_event_id(&self, source_event_id: &str) -> bool {
+    fn has_source_event_id(&self, source_event_id: &str) -> bool {
         self.outbox.iter().any(|event| {
             event
                 .envelope
@@ -271,32 +282,56 @@ impl DurableState {
         })
     }
 
-    pub(crate) fn matches_queued_source_event(
+    pub(crate) fn has_executor_event_receipt(
         &self,
-        source_event_id: &str,
+        executor_event_id: &str,
         event_type: &str,
         priority: EventPriority,
         payload: &Value,
     ) -> Result<bool, DurableRunnerError> {
-        let Some(existing) = self.outbox.iter().find(|event| {
-            event
-                .envelope
-                .pointer("/payload/sourceEventId")
-                .and_then(Value::as_str)
-                == Some(source_event_id)
-        }) else {
+        self.source_event_id_for_executor(executor_event_id)?;
+        let Some(existing) = self.executor_event_receipts.get(executor_event_id) else {
             return Ok(false);
         };
-        let sanitized_payload = sanitize_value(payload);
-        if existing.event_type != event_type
-            || existing.priority != priority.number()
-            || existing.envelope.pointer("/payload/payload") != Some(&sanitized_payload)
-        {
+        if existing.fingerprint != executor_event_fingerprint(event_type, priority, payload) {
             return Err(DurableRunnerError::invalid(
                 "executor event identity was reused with different event data",
             ));
         }
         Ok(true)
+    }
+
+    pub(crate) fn enqueue_executor_event(
+        &mut self,
+        config: &DurableRunnerConfig,
+        executor_event_id: String,
+        event_type: String,
+        priority: EventPriority,
+        payload: Value,
+    ) -> Result<u64, DurableRunnerError> {
+        if self.has_executor_event_receipt(&executor_event_id, &event_type, priority, &payload)? {
+            return Err(DurableRunnerError::invalid(
+                "executor event identity is already committed",
+            ));
+        }
+        let source_event_id = self.source_event_id_for_executor(&executor_event_id)?;
+        let fingerprint = executor_event_fingerprint(&event_type, priority, &payload);
+        let source_seq = self.enqueue_event_with_source_event_id(
+            config,
+            source_event_id,
+            event_type,
+            priority,
+            payload,
+        )?;
+        self.executor_event_receipts.insert(
+            executor_event_id,
+            ExecutorEventReceipt {
+                fingerprint,
+                source_seq,
+            },
+        );
+        self.compact_executor_event_receipts();
+        Ok(source_seq)
     }
 
     pub(crate) fn enqueue_event_with_source_event_id(
@@ -573,6 +608,20 @@ impl DurableState {
             }
         }
     }
+
+    fn compact_executor_event_receipts(&mut self) {
+        while self.executor_event_receipts.len() > MAX_EXECUTOR_EVENT_RECEIPTS {
+            let Some(oldest_id) = self
+                .executor_event_receipts
+                .iter()
+                .min_by_key(|(_, receipt)| receipt.source_seq)
+                .map(|(event_id, _)| event_id.clone())
+            else {
+                break;
+            };
+            self.executor_event_receipts.remove(&oldest_id);
+        }
+    }
 }
 
 fn command_result(command: &Command, status: &str, result: Value) -> StoredCommandResult {
@@ -597,6 +646,19 @@ fn command_fingerprint(command: &Command) -> Result<String, DurableRunnerError> 
         fingerprint.push(HEX[usize::from(byte & 0x0f)] as char);
     }
     Ok(fingerprint)
+}
+
+fn executor_event_fingerprint(
+    event_type: &str,
+    priority: EventPriority,
+    payload: &Value,
+) -> String {
+    let identity = json!({
+        "eventType": event_type,
+        "priority": priority.number(),
+        "payload": sanitize_value(payload),
+    });
+    format!("{:x}", Sha256::digest(canonical_json(&identity).as_bytes()))
 }
 
 fn canonical_json(value: &Value) -> String {
@@ -846,6 +908,23 @@ fn validate_binding(
         || (allow_legacy_command_journal
             && !state.processed_commands.is_empty()
             && state.processed_command_fingerprints.is_empty());
+    let mut executor_receipt_sequences = HashSet::new();
+    let executor_event_receipts_are_valid = state.executor_event_receipts.len()
+        <= MAX_EXECUTOR_EVENT_RECEIPTS
+        && state
+            .executor_event_receipts
+            .iter()
+            .all(|(event_id, receipt)| {
+                state.source_event_id_for_executor(event_id).is_ok()
+                    && receipt.fingerprint.len() == 64
+                    && receipt
+                        .fingerprint
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                    && receipt.source_seq > 0
+                    && receipt.source_seq <= state.highest_source_seq()
+                    && executor_receipt_sequences.insert(receipt.source_seq)
+            });
     command_sequences.sort_unstable();
     let command_cursors_are_valid = match (command_sequences.first(), command_sequences.last()) {
         (None, None) => state.compacted_through_controller_seq == state.last_controller_command_seq,
@@ -871,6 +950,7 @@ fn validate_binding(
         || state.compacted_through_controller_seq > state.last_controller_command_seq
         || !command_cursors_are_valid
         || !command_fingerprints_are_valid
+        || !executor_event_receipts_are_valid
     {
         return Err(DurableRunnerError::invalid(
             "durable state cursors, bounds, or journals are inconsistent",

@@ -34,9 +34,11 @@ outbox commit. Batches commit one event at a time, so a later oversized event or
 capacity failure cannot roll back the accepted prefix or discard the
 unacknowledged suffix. Each retained executor event has a stable identity that
 runnerd derives into its PRP `sourceEventId`. If the process stops after the
-outbox commit but before the executor acknowledgement, recovery recognizes the
-existing outbox record and acknowledges the retained copy without appending a
-second event.
+outbox commit but before the executor acknowledgement, a bounded durable
+receipt journal recognizes and byte-validates the retained copy without
+appending a second event. Receipts outlive transport ACK removal; because the
+provider queue is ordered and bounded, a possibly retained front event cannot
+be evicted while later events advance the journal.
 
 Commands require a contiguous controller sequence. The runner journals a
 pending command before invoking its executor and persists its result afterward.

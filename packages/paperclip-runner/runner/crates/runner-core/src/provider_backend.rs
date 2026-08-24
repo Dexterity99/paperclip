@@ -35,6 +35,8 @@ struct CodexProviderState {
     provider_session_id: Option<String>,
     #[serde(default)]
     active_provider_turn_id: Option<String>,
+    #[serde(default)]
+    pending_events: VecDeque<NormalizedProviderEvent>,
 }
 
 impl CodexProviderState {
@@ -46,6 +48,7 @@ impl CodexProviderState {
             thread_id: None,
             provider_session_id: None,
             active_provider_turn_id: None,
+            pending_events: VecDeque::new(),
         }
     }
 
@@ -75,7 +78,17 @@ impl CodexProviderState {
                     || self.active_provider_turn_id.is_some()
                     || matches!(self.lifecycle.as_str(), "session_open" | "turn_active")))
             || (self.lifecycle == "turn_active" && self.active_provider_turn_id.is_none())
-            || (self.lifecycle != "turn_active" && self.active_provider_turn_id.is_some())
+            || (matches!(
+                self.lifecycle.as_str(),
+                "prepared" | "session_open" | "closed"
+            ) && self.active_provider_turn_id.is_some())
+            || self.pending_events.len() > MAX_EVENTS_PER_POLL + 1
+            || self.pending_events.iter().any(|event| {
+                event.event_type.is_empty()
+                    || event.event_type.len() > 160
+                    || event.event_type.chars().any(char::is_control)
+                    || !event.payload.is_object()
+            })
         {
             return Err(DurableRunnerError::invalid(
                 "Codex provider state is malformed or inconsistent",
@@ -90,7 +103,6 @@ pub struct CodexCommandExecutor {
     state: Option<CodexProviderState>,
     provider: Option<CodexProvider>,
     restore_checked: bool,
-    pending_events: VecDeque<NormalizedProviderEvent>,
 }
 
 impl CodexCommandExecutor {
@@ -100,7 +112,6 @@ impl CodexCommandExecutor {
             state: None,
             provider: None,
             restore_checked: false,
-            pending_events: VecDeque::new(),
         }
     }
 
@@ -148,10 +159,14 @@ impl CodexCommandExecutor {
             return Ok(());
         };
         if self.provider.is_some()
-            || !matches!(state.lifecycle.as_str(), "session_open" | "turn_active")
+            || !matches!(
+                state.lifecycle.as_str(),
+                "session_open" | "turn_active" | "provider_exited"
+            )
         {
             return Ok(());
         }
+        let provider_had_exited = state.lifecycle == "provider_exited";
         let thread_id = state.thread_id.clone().ok_or_else(|| {
             DurableRunnerError::invalid("recoverable Codex state omitted its thread id")
         })?;
@@ -161,7 +176,7 @@ impl CodexCommandExecutor {
         })?;
         let recovered_active_turn_id = provider.active_provider_turn_id().map(str::to_owned);
         self.provider = Some(provider);
-        if recovered_active_turn_id != previous_active_turn_id {
+        if provider_had_exited || recovered_active_turn_id != previous_active_turn_id {
             let state = self
                 .state
                 .as_mut()
@@ -172,7 +187,7 @@ impl CodexCommandExecutor {
             } else {
                 "session_open".to_owned()
             };
-            self.pending_events.push_back(NormalizedProviderEvent {
+            state.pending_events.push_back(NormalizedProviderEvent {
                 event_type: "session.reconciled".to_owned(),
                 priority: EventPriority::P0,
                 payload: json!({
@@ -192,6 +207,10 @@ impl CodexCommandExecutor {
             .state
             .as_ref()
             .ok_or_else(|| DurableRunnerError::invalid("Codex provider state is unavailable"))?;
+        self.persist_state(state)
+    }
+
+    fn persist_state(&self, state: &CodexProviderState) -> Result<(), DurableRunnerError> {
         state.validate()?;
         fs::create_dir_all(&self.state_dir).map_err(|error| {
             DurableRunnerError::invalid(format!(
@@ -299,6 +318,7 @@ impl CodexCommandExecutor {
     }
 
     fn open_session(&mut self) -> Result<CommandExecution, DurableRunnerError> {
+        self.restore_provider_if_needed()?;
         if self
             .state
             .as_ref()
@@ -361,6 +381,7 @@ impl CodexCommandExecutor {
     }
 
     fn start_turn(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
+        self.restore_provider_if_needed()?;
         if self
             .state
             .as_ref()
@@ -414,6 +435,7 @@ impl CodexCommandExecutor {
     }
 
     fn interrupt_turn(&mut self, reason: &str) -> Result<CommandExecution, DurableRunnerError> {
+        self.restore_provider_if_needed()?;
         let provider_turn_id = self
             .state
             .as_ref()
@@ -494,6 +516,7 @@ impl CodexCommandExecutor {
     }
 
     fn snapshot(&mut self) -> Result<CommandExecution, DurableRunnerError> {
+        self.restore_provider_if_needed()?;
         let state = self
             .state
             .as_ref()
@@ -509,6 +532,13 @@ impl CodexCommandExecutor {
 
     fn poll_provider(&mut self) -> Result<(), DurableRunnerError> {
         self.restore()?;
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| !state.pending_events.is_empty())
+        {
+            return Ok(());
+        }
         if self.provider.is_none() {
             return Ok(());
         }
@@ -524,15 +554,17 @@ impl CodexCommandExecutor {
             let Some(event) = event else { break };
             match event {
                 CodexProviderEvent::Notification { method, params } => {
+                    let normalized = normalize_codex_notification(&method, &params);
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state remains available while polling");
                     if method == "turn/completed" {
-                        if let Some(state) = self.state.as_mut() {
-                            state.active_provider_turn_id = None;
-                            state.lifecycle = "session_open".to_owned();
-                            self.save_state()?;
-                        }
+                        state.active_provider_turn_id = None;
+                        state.lifecycle = "session_open".to_owned();
                     }
-                    self.pending_events
-                        .extend(normalize_codex_notification(&method, &params));
+                    state.pending_events.extend(normalized);
+                    self.save_state()?;
                 }
                 CodexProviderEvent::RuntimeRequest {
                     request_id,
@@ -543,44 +575,48 @@ impl CodexCommandExecutor {
                         .or_else(|| question_set.pointer("/questions/0/prompt"))
                         .and_then(Value::as_str)
                         .unwrap_or("Codex needs your input");
-                    self.pending_events.push_back(NormalizedProviderEvent {
-                        event_type: "runtime_request.created".to_owned(),
-                        priority: EventPriority::P0,
-                        payload: json!({
-                            "request": {
-                                "schema": "paperclip.runtime_request.v2",
-                                "requestKind": "runtime",
-                                "requestId": request_id,
-                                "type": "input",
-                                "status": "pending",
-                                "prompt": prompt,
-                                "input": question_set,
-                                "origin": {
-                                    "adapter": "codex-app-server",
-                                    "provider": "codex",
-                                    "method": "item/tool/requestUserInput",
+                    self.state
+                        .as_mut()
+                        .expect("Codex state remains available while polling")
+                        .pending_events
+                        .push_back(NormalizedProviderEvent {
+                            event_type: "runtime_request.created".to_owned(),
+                            priority: EventPriority::P0,
+                            payload: json!({
+                                "request": {
+                                    "schema": "paperclip.runtime_request.v2",
+                                    "requestKind": "runtime",
+                                    "requestId": request_id,
+                                    "type": "input",
+                                    "status": "pending",
+                                    "prompt": prompt,
+                                    "input": question_set,
+                                    "origin": {
+                                        "adapter": "codex-app-server",
+                                        "provider": "codex",
+                                        "method": "item/tool/requestUserInput",
+                                    },
                                 },
-                            },
-                        }),
-                    });
+                            }),
+                        });
+                    self.save_state()?;
                 }
                 CodexProviderEvent::Exited { exit_code, success } => {
                     self.provider = None;
                     if let Some(state) = self.state.as_mut() {
-                        state.active_provider_turn_id = None;
                         state.lifecycle = "provider_exited".to_owned();
-                        self.save_state()?;
+                        state.pending_events.push_back(NormalizedProviderEvent {
+                            event_type: "session.failed".to_owned(),
+                            priority: EventPriority::P0,
+                            payload: json!({
+                                "provider": "codex",
+                                "code": "provider_exited",
+                                "exitCode": exit_code,
+                                "expected": success,
+                            }),
+                        });
                     }
-                    self.pending_events.push_back(NormalizedProviderEvent {
-                        event_type: "session.failed".to_owned(),
-                        priority: EventPriority::P0,
-                        payload: json!({
-                            "provider": "codex",
-                            "code": "provider_exited",
-                            "exitCode": exit_code,
-                            "expected": success,
-                        }),
-                    });
+                    self.save_state()?;
                     break;
                 }
             }
@@ -629,10 +665,37 @@ impl CommandExecutor for CodexCommandExecutor {
     fn poll_events(&mut self) -> Result<Vec<(String, EventPriority, Value)>, DurableRunnerError> {
         self.poll_provider()?;
         Ok(self
-            .pending_events
-            .drain(..)
-            .map(|event| (event.event_type, event.priority, event.payload))
+            .state
+            .as_ref()
+            .into_iter()
+            .flat_map(|state| state.pending_events.iter())
+            .map(|event| {
+                (
+                    event.event_type.clone(),
+                    event.priority,
+                    event.payload.clone(),
+                )
+            })
             .collect())
+    }
+
+    fn acknowledge_events(&mut self, count: usize) -> Result<(), DurableRunnerError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let mut next_state = self
+            .state
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider state is unavailable"))?;
+        if count > next_state.pending_events.len() {
+            return Err(DurableRunnerError::invalid(
+                "provider event acknowledgement exceeded the pending prefix",
+            ));
+        }
+        next_state.pending_events.drain(..count);
+        self.persist_state(&next_state)?;
+        self.state = Some(next_state);
+        Ok(())
     }
 
     fn shutdown(&mut self) -> Result<(), DurableRunnerError> {
@@ -672,6 +735,7 @@ mod tests {
             thread_id: Some("thread-1".to_owned()),
             provider_session_id: None,
             active_provider_turn_id: None,
+            pending_events: VecDeque::new(),
         };
         assert!(state.validate().is_err());
     }

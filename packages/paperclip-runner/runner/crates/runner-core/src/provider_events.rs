@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -5,7 +6,8 @@ use crate::durable::{redact_text, EventPriority};
 
 const MAX_TEXT_CHARS: usize = 4_000;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NormalizedProviderEvent {
     pub event_type: String,
     pub priority: EventPriority,

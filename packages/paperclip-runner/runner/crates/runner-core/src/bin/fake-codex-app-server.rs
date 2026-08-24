@@ -86,6 +86,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let call_log = argument(&args, "--call-log").map(PathBuf::from);
     let emit_question = args.iter().any(|value| value == "--emit-question");
     let hold_turn = args.iter().any(|value| value == "--hold-turn");
+    let exit_after_turn_start = args.iter().any(|value| value == "--exit-after-turn-start");
     let pre_response_notification = args
         .iter()
         .any(|value| value == "--notification-before-response");
@@ -150,7 +151,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "method": "turn/started",
                     "params": {"turn": {"id": "provider-turn-1"}}
                 }))?;
-                if emit_question {
+                if exit_after_turn_start {
+                    return Ok(());
+                } else if emit_question {
                     send(json!({
                         "id": "runtime-request-1",
                         "method": "item/tool/requestUserInput",

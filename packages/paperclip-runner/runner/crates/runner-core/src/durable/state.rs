@@ -21,7 +21,8 @@ const MAX_COMMAND_RESULT_BYTES: usize = 64 * 1024;
 const STATE_OVERHEAD_BYTES: usize = 16 * 1024 * 1024;
 const TEMP_FILE_ATTEMPTS: usize = 32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EventPriority {
     P0,
     P1,

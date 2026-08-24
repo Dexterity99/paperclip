@@ -35,6 +35,13 @@ pub trait CommandExecutor {
         Ok(Vec::new())
     }
 
+    /// Removes the prefix returned by `poll_events` after each event is
+    /// durably committed to the PRP outbox. Implementations that retain
+    /// provider events must not remove them before this acknowledgement.
+    fn acknowledge_events(&mut self, _count: usize) -> Result<(), DurableRunnerError> {
+        Ok(())
+    }
+
     fn shutdown(&mut self) -> Result<(), DurableRunnerError> {
         Ok(())
     }
@@ -290,9 +297,16 @@ fn poll_executor_events<E: CommandExecutor>(
         return Ok(());
     }
     for (event_type, priority, payload) in events {
-        state.enqueue_event(config, event_type, priority, payload)?;
+        // Commit and acknowledge one event at a time. If a later event is
+        // oversized or the outbox is full, the accepted prefix is already
+        // durable and the unacknowledged suffix remains with the executor.
+        let mut next_state = state.clone();
+        next_state.enqueue_event(config, event_type, priority, payload)?;
+        store.save(&next_state)?;
+        *state = next_state;
+        executor.acknowledge_events(1)?;
     }
-    store.save(state)
+    Ok(())
 }
 
 fn process_command<E: CommandExecutor>(
@@ -387,6 +401,7 @@ fn control_envelope(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -397,10 +412,36 @@ mod tests {
         calls: usize,
     }
 
+    struct RetainingEventExecutor {
+        events: VecDeque<(String, EventPriority, Value)>,
+    }
+
     impl CommandExecutor for CountingExecutor {
         fn execute(&mut self, _command: &Command) -> Result<CommandExecution, DurableRunnerError> {
             self.calls += 1;
             Ok(CommandExecution::result(json!({"calls": self.calls})))
+        }
+    }
+
+    impl CommandExecutor for RetainingEventExecutor {
+        fn execute(&mut self, _command: &Command) -> Result<CommandExecution, DurableRunnerError> {
+            Ok(CommandExecution::result(json!({"status": "completed"})))
+        }
+
+        fn poll_events(
+            &mut self,
+        ) -> Result<Vec<(String, EventPriority, Value)>, DurableRunnerError> {
+            Ok(self.events.iter().cloned().collect())
+        }
+
+        fn acknowledge_events(&mut self, count: usize) -> Result<(), DurableRunnerError> {
+            if count > self.events.len() {
+                return Err(DurableRunnerError::invalid(
+                    "test acknowledgement exceeded pending events",
+                ));
+            }
+            self.events.drain(..count);
+            Ok(())
         }
     }
 
@@ -435,6 +476,49 @@ mod tests {
             precondition: None,
             payload: json!({}),
         }
+    }
+
+    #[test]
+    fn event_batch_keeps_accepted_prefix_and_unacknowledged_suffix() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-event-batch-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let mut config = config(directory.clone());
+        config.max_frame_bytes = 1024;
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let mut executor = RetainingEventExecutor {
+            events: VecDeque::from([
+                (
+                    "provider.notice.recorded".to_owned(),
+                    EventPriority::P1,
+                    json!({"message": "durable prefix"}),
+                ),
+                (
+                    "provider.notice.recorded".to_owned(),
+                    EventPriority::P1,
+                    json!({"message": "x".repeat(2048)}),
+                ),
+            ]),
+        };
+
+        let error = poll_executor_events(&mut state, &store, &config, &mut executor)
+            .expect_err("the oversized suffix must fail closed");
+        assert!(error.to_string().contains("transport frame limit"));
+        assert_eq!(state.outbox.len(), 1);
+        assert_eq!(state.outbox[0].event_type, "provider.notice.recorded");
+        assert_eq!(executor.events.len(), 1);
+        assert_eq!(
+            executor.events[0].2["message"],
+            Value::String("x".repeat(2048))
+        );
+
+        let (reloaded, recovered) = store.load_or_create(&config).unwrap();
+        assert!(recovered);
+        assert_eq!(reloaded.outbox.len(), 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

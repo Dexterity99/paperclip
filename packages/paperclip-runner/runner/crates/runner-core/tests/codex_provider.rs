@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use paperclip_runner_core::codex_provider::{
     CodexProvider, CodexProviderConfig, CodexProviderEvent,
 };
-use paperclip_runner_core::durable::{Command, CommandExecutor};
+use paperclip_runner_core::durable::{Command, CommandExecutor, DurableRunnerError, EventPriority};
 use paperclip_runner_core::provider_backend::CodexCommandExecutor;
 use paperclip_runner_core::provider_events::normalize_codex_notification;
 use serde_json::{json, Value};
@@ -69,6 +69,14 @@ fn call_count(directory: &Path, method: &str) -> usize {
         .lines()
         .filter(|line| *line == method)
         .count()
+}
+
+fn poll_and_ack(
+    executor: &mut CodexCommandExecutor,
+) -> Result<Vec<(String, EventPriority, Value)>, DurableRunnerError> {
+    let events = executor.poll_events()?;
+    executor.acknowledge_events(events.len())?;
+    Ok(events)
 }
 
 #[test]
@@ -156,7 +164,7 @@ fn durable_backend_resumes_the_active_thread_without_restarting_the_turn() {
         .expect("interrupt recovered provider turn");
     let mut terminal_seen = false;
     for _ in 0..16 {
-        let events = recovered.poll_events().expect("poll interrupted turn");
+        let events = poll_and_ack(&mut recovered).expect("poll interrupted turn");
         terminal_seen |= events
             .iter()
             .any(|(event_type, _, _)| event_type == "turn.interrupted");
@@ -165,6 +173,130 @@ fn durable_backend_resumes_the_active_thread_without_restarting_the_turn() {
         }
     }
     assert!(terminal_seen);
+    recovered
+        .shutdown()
+        .expect("stop recovered provider process");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn provider_exit_preserves_and_reconciles_the_active_turn() {
+    let directory = temporary_directory("exit-active-turn");
+    let config = provider_config(&directory, &["--exit-after-turn-start"]);
+    let mut executor = CodexCommandExecutor::new(&directory);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare Codex provider");
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+    executor
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Keep the native turn active while the provider exits."}),
+        ))
+        .expect("start provider turn");
+
+    let mut provider_exit_seen = false;
+    for _ in 0..32 {
+        provider_exit_seen |= poll_and_ack(&mut executor)
+            .expect("poll provider exit")
+            .iter()
+            .any(|(event_type, _, _)| event_type == "session.failed");
+        if provider_exit_seen {
+            break;
+        }
+    }
+    assert!(provider_exit_seen);
+    let persisted: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read provider state after exit"),
+    )
+    .expect("parse provider state after exit");
+    assert_eq!(persisted["lifecycle"], "provider_exited");
+    assert_eq!(persisted["activeProviderTurnId"], "provider-turn-1");
+
+    let interrupted = executor
+        .execute(&command("interrupt", 4, "turn.interrupt", json!({})))
+        .expect("interrupt reconciled provider turn");
+    assert_eq!(interrupted.result["status"], "interrupt_requested");
+    assert_eq!(call_count(&directory, "thread/resume"), 1);
+    assert_eq!(call_count(&directory, "thread/read"), 1);
+    assert_eq!(call_count(&directory, "turn/interrupt"), 1);
+
+    let mut terminal_seen = false;
+    for _ in 0..32 {
+        terminal_seen |= poll_and_ack(&mut executor)
+            .expect("poll reconciled interruption")
+            .iter()
+            .any(|(event_type, _, _)| event_type == "turn.interrupted");
+        if terminal_seen {
+            break;
+        }
+    }
+    assert!(terminal_seen);
+    executor.shutdown().expect("stop resumed provider process");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn unacknowledged_provider_events_survive_executor_restart() {
+    let directory = temporary_directory("pending-event-recovery");
+    let config = provider_config(&directory, &["--emit-question"]);
+    let mut first = CodexCommandExecutor::new(&directory);
+    first
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare Codex provider");
+    first
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+    first
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Emit a durable question."}),
+        ))
+        .expect("start provider turn");
+
+    let mut retained = None;
+    for _ in 0..32 {
+        let events = first.poll_events().expect("poll provider events");
+        if events
+            .iter()
+            .any(|(event_type, _, _)| event_type == "runtime_request.created")
+        {
+            retained = Some(events);
+            break;
+        }
+        first
+            .acknowledge_events(events.len())
+            .expect("acknowledge events before the question");
+    }
+    let retained = retained.expect("observe a durable runtime request");
+    first.shutdown().expect("stop first provider process");
+    drop(first);
+
+    let mut recovered = CodexCommandExecutor::new(&directory);
+    let replayed = recovered
+        .poll_events()
+        .expect("reload unacknowledged provider events");
+    assert_eq!(&replayed[..retained.len()], retained.as_slice());
+    recovered
+        .acknowledge_events(replayed.len())
+        .expect("acknowledge reloaded provider events");
     recovered
         .shutdown()
         .expect("stop recovered provider process");
@@ -201,7 +333,7 @@ fn structured_question_round_trips_through_the_normalized_backend() {
     let mut question_set = None;
     let mut provider_started_events = 0;
     for _ in 0..16 {
-        for (event_type, _, payload) in executor.poll_events().expect("poll question") {
+        for (event_type, _, payload) in poll_and_ack(&mut executor).expect("poll question") {
             provider_started_events += usize::from(event_type == "turn.started");
             if event_type == "runtime_request.created" {
                 assert_eq!(payload["request"]["schema"], "paperclip.runtime_request.v2");
@@ -236,8 +368,7 @@ fn structured_question_round_trips_through_the_normalized_backend() {
         .expect("deliver normalized response");
     let mut completed = false;
     for _ in 0..16 {
-        completed |= executor
-            .poll_events()
+        completed |= poll_and_ack(&mut executor)
             .expect("poll completed question turn")
             .iter()
             .any(|(event_type, _, _)| event_type == "turn.completed");

@@ -23,16 +23,21 @@ path yet.
 
 ## Recovery and duplicate safety
 
-The provider descriptor, Codex thread ID, account session ID, and active Codex
-turn ID are written to a private, bounded, atomically replaced sidecar in the
-runner state directory. On restart, runnerd resumes that exact thread and
-reconciles the active turn from `thread/read`.
+The provider descriptor, Codex thread ID, account session ID, active Codex turn
+ID, and unacknowledged normalized-event prefix are written to a private,
+bounded, atomically replaced sidecar in the runner state directory. On restart,
+runnerd resumes that exact thread and reconciles the active turn from
+`thread/read`. An unexpected provider exit retains the last active turn until
+that reconciliation proves whether it is still running, so cancellation and a
+later turn cannot diverge from Codex's native state.
 
 PRP journals every command before the provider effect. Exact command replay
 returns the durable result without invoking Codex again. A crash in the effect
 window remains indeterminate and is not retried. Codex JSON-RPC notifications
 received before a synchronous response are buffered rather than lost. Reusing
 a pending structured-input request ID with different content fails closed.
+Normalized events remain in the provider sidecar until the durable PRP outbox
+has committed and acknowledged them.
 
 ## Normalization and authorization
 

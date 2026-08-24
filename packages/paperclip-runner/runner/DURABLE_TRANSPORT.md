@@ -29,6 +29,11 @@ source sequence the runner has produced; acknowledged prefixes are removed
 atomically from durable state. After disconnect, every remaining event is sent
 again with the same identity and source sequence.
 
+Executors retain polled events until runnerd acknowledges each event after its
+outbox commit. Batches commit one event at a time, so a later oversized event or
+capacity failure cannot roll back the accepted prefix or discard the
+unacknowledged suffix.
+
 Commands require a contiguous controller sequence. The runner journals a
 pending command before invoking its executor and persists its result afterward.
 An exact duplicate returns the stored result without repeating the effect. If

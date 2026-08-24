@@ -1,7 +1,9 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
+import http2 from "node:http2";
 import os from "node:os";
 import path from "node:path";
+import type { Duplex } from "node:stream";
 
 import {
   runWithoutActiveStep,
@@ -1828,6 +1830,209 @@ export async function startSandboxCallbackBridgeServer(input: {
       if (stopResult.timedOut) {
         throw new Error(buildRunnerFailureMessage("stop sandbox callback bridge", stopResult));
       }
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox HTTP/2 client gateway
+//
+// This gateway turns each local loopback request into one HTTP/2 stream to
+// the host server in `http2-bridge-server.ts`. It sits beside the file-mode
+// and duplex-mode gateways above; it changes neither of them, and no mode
+// dispatch selects it yet — a later phase wires it into the generated
+// in-sandbox entrypoint and the transport-selection path.
+// ---------------------------------------------------------------------------
+
+/**
+ * Constant-time bridge-token compare. Both this sandbox gateway and the host
+ * server in `http2-bridge-server.ts` import this one helper, so the gateway
+ * check and the independent host check (accepted security fix 4) apply the
+ * exact same comparison rule. A length mismatch returns `false` without a
+ * `timingSafeEqual` call, because `timingSafeEqual` throws on unequal buffer
+ * lengths; both operands are bridge tokens of near-fixed length, so this one
+ * length branch leaks no useful timing signal.
+ */
+export function compareBridgeTokensConstantTime(
+  expected: string,
+  received: string | null | undefined,
+): boolean {
+  const expectedBytes = Buffer.from(expected, "utf8");
+  const receivedBytes = Buffer.from(typeof received === "string" ? received : "", "utf8");
+  if (expectedBytes.length !== receivedBytes.length) return false;
+  return timingSafeEqual(expectedBytes, receivedBytes);
+}
+
+const SANDBOX_HTTP2_GATEWAY_DEFAULT_AUTHORITY = "bridge.internal";
+
+/** One local request the gateway forwards as one HTTP/2 stream. */
+export interface SandboxHttp2BridgeGatewayRequest {
+  method: string;
+  path: string;
+  query: string;
+  headers: Record<string, string>;
+  body: Buffer;
+  /**
+   * The token the local caller presented. The gateway check (accepted
+   * security fix 4 keeps this alongside the independent host check) compares
+   * it against the per-run bridge token before it opens a stream.
+   */
+  receivedToken: string | null | undefined;
+}
+
+/** The response one forwarded HTTP/2 stream carried back. */
+export interface SandboxHttp2BridgeGatewayResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: Buffer;
+}
+
+export interface SandboxHttp2BridgeGateway {
+  /** Forward one local request as one HTTP/2 stream over the client session. */
+  forwardRequest(
+    request: SandboxHttp2BridgeGatewayRequest,
+  ): Promise<SandboxHttp2BridgeGatewayResponse>;
+  /** Close the HTTP/2 client session. Safe to call more than one time. */
+  close(): Promise<void>;
+}
+
+export interface CreateSandboxHttp2BridgeGatewayOptions {
+  /**
+   * The per-run bridge token. The gateway checks every request against it,
+   * then attaches it to the outbound HTTP/2 stream as the `authorization`
+   * header, so the host can run its own independent check.
+   */
+  bridgeToken: string;
+  /**
+   * Open the transport the HTTP/2 client session runs on. Returns a `Duplex`
+   * already connected to the host — the sandbox process's own channel in
+   * production, or one side of a paired in-memory `Duplex` in a test.
+   */
+  createConnection: () => Duplex;
+  /** The `:authority` pseudo-header value. The channel carries no real network
+   * address, so this is a fixed label. The default is `bridge.internal`. */
+  authority?: string;
+  /** The header allowlist applied to every outbound request. The default is
+   * {@link DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST}. */
+  headerAllowlist?: readonly string[];
+  /**
+   * The sink for a GOAWAY the host sends. The host names the last client
+   * stream ID it processed; a caller classifies each of its own dispatched
+   * stream IDs against it with `classifyStreamAgainstGoaway` in
+   * `http2-bridge-server.ts` to know which requests need a retry elsewhere.
+   */
+  onGoaway?: (record: { lastStreamId: number; errorCode: number }) => void;
+}
+
+function forwardOneHttp2Request(
+  session: http2.ClientHttp2Session,
+  request: {
+    bridgeToken: string;
+    method: string;
+    path: string;
+    query: string;
+    headers: Record<string, string>;
+    body: Buffer;
+  },
+): Promise<SandboxHttp2BridgeGatewayResponse> {
+  return new Promise((resolve, reject) => {
+    const query = request.query.trim();
+    const pathWithQuery =
+      query.length === 0 ? request.path : `${request.path}${query.startsWith("?") ? query : `?${query}`}`;
+    const requestHeaders: http2.OutgoingHttpHeaders = {
+      ":method": request.method,
+      ":path": pathWithQuery,
+      authorization: `Bearer ${request.bridgeToken}`,
+      ...request.headers,
+    };
+    let stream: http2.ClientHttp2Stream;
+    try {
+      stream = session.request(requestHeaders, { endStream: request.body.length === 0 });
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let responseHeaders: Record<string, string> = {};
+    let status = 502;
+    let settled = false;
+    const settle = (run: () => void) => {
+      if (settled) return;
+      settled = true;
+      run();
+    };
+    stream.on("response", (headers) => {
+      const rawStatus = headers[":status"];
+      status = typeof rawStatus === "number" ? rawStatus : Number(rawStatus) || 502;
+      responseHeaders = {};
+      for (const [key, value] of Object.entries(headers)) {
+        if (key.startsWith(":") || value == null) continue;
+        responseHeaders[key] = Array.isArray(value) ? value.join(", ") : String(value);
+      }
+    });
+    stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+    stream.once("end", () => settle(() => resolve({ status, headers: responseHeaders, body: Buffer.concat(chunks) })));
+    stream.once("error", (error) =>
+      settle(() => reject(error instanceof Error ? error : new Error(String(error)))),
+    );
+    stream.once("aborted", () => settle(() => reject(new Error("Bridge HTTP/2 stream aborted."))));
+    if (request.body.length > 0) {
+      stream.end(request.body);
+    } else if (!stream.writableEnded) {
+      stream.end();
+    }
+  });
+}
+
+/**
+ * Create the sandbox HTTP/2 client gateway. It opens one HTTP/2 client
+ * session on the transport `createConnection` returns, and forwards each
+ * local request the caller hands it (already checked against the bridge
+ * token — see {@link SandboxHttp2BridgeGatewayRequest.receivedToken}) as one
+ * HTTP/2 stream. It keeps the header allowlist on the sandbox side, exactly
+ * as the file-mode and duplex-mode gateways do.
+ */
+export function createSandboxHttp2BridgeGateway(
+  options: CreateSandboxHttp2BridgeGatewayOptions,
+): SandboxHttp2BridgeGateway {
+  const authority = options.authority?.trim() || SANDBOX_HTTP2_GATEWAY_DEFAULT_AUTHORITY;
+  const headerAllowlist = options.headerAllowlist ?? DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST;
+  const session = http2.connect(`http://${authority}`, {
+    createConnection: options.createConnection,
+  });
+  // A session-level fault fails every in-flight `forwardRequest` call through
+  // that stream's own `error`/`aborted` handler. This listener only stops
+  // Node from raising an unhandled `error` event for the session itself.
+  session.on("error", () => undefined);
+  session.on("goaway", (errorCode: number, lastStreamId: number) => {
+    options.onGoaway?.({ lastStreamId, errorCode });
+  });
+
+  return {
+    forwardRequest(request: SandboxHttp2BridgeGatewayRequest): Promise<SandboxHttp2BridgeGatewayResponse> {
+      // The gateway check (accepted security fix 4 keeps this as well as the
+      // independent host-side check): a request whose token does not match
+      // the per-run bridge token never opens a stream.
+      if (!compareBridgeTokensConstantTime(options.bridgeToken, request.receivedToken)) {
+        return Promise.reject(new Error("Invalid bridge token."));
+      }
+      return forwardOneHttp2Request(session, {
+        bridgeToken: options.bridgeToken,
+        method: request.method,
+        path: request.path,
+        query: request.query,
+        headers: sanitizeSandboxCallbackBridgeHeaders(request.headers, headerAllowlist),
+        body: request.body,
+      });
+    },
+    close(): Promise<void> {
+      return new Promise((resolve) => {
+        if (session.closed || session.destroyed) {
+          resolve();
+          return;
+        }
+        session.close(() => resolve());
+      });
     },
   };
 }

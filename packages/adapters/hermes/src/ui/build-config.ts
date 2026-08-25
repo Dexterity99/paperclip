@@ -16,6 +16,20 @@ import {
   DEFAULT_TIMEOUT_SEC,
 } from "../shared/constants.js";
 
+function withoutReasoningArgs(args: string[]): string[] {
+  const clean: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (value === "--reasoning" || value === "--reasoning-effort") {
+      index += 1;
+      continue;
+    }
+    if (value.startsWith("--reasoning=") || value.startsWith("--reasoning-effort=")) continue;
+    clean.push(value);
+  }
+  return clean;
+}
+
 /**
  * Build a Hermes Agent adapter config from the Paperclip UI form values.
  */
@@ -71,8 +85,8 @@ export function buildHermesConfig(
 
   // Thinking/reasoning effort
   if (v.thinkingEffort) {
-    const existing = (ac.extraArgs as string[]) || [];
-    existing.push("--reasoning-effort", String(v.thinkingEffort));
+    const existing = withoutReasoningArgs((ac.extraArgs as string[]) || []);
+    existing.push("--reasoning", String(v.thinkingEffort));
     ac.extraArgs = existing;
   }
 

@@ -287,39 +287,40 @@
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --bubble-agent: oklch(0.185 0 0);
-  --secondary: oklch(0.269 0 0);
+  /* Keystone Forge dark product theme: shared navy surfaces, gold action and teal focus. */
+  --background: #071019;
+  --foreground: #edf2f8;
+  --card: #101c2b;
+  --card-foreground: #edf2f8;
+  --popover: #101c2b;
+  --popover-foreground: #edf2f8;
+  --primary: #f0ad4e;
+  --primary-foreground: #1a1208;
+  --bubble-agent: #0c1826;
+  --secondary: #14243a;
   --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
+  --muted: #14243a;
+  --muted-foreground: #91a3ba;
+  --accent: #173047;
+  --accent-foreground: #edf2f8;
   --destructive: oklch(0.637 0.237 25.331); /* Gallery feedback round 1: user preferred master's original dark destructive red over the preset's softer 0.704 0.191 22.216. */
   --destructive-foreground: oklch(0.985 0 0);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
+  --border: #263b54;
+  --input: #314861;
+  --ring: #54d8c4;
   --chart-1: oklch(0.87 0 0);
   --chart-2: oklch(0.556 0 0);
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
+  --sidebar: #0a1522;
+  --sidebar-foreground: #edf2f8;
+  --sidebar-primary: #f0ad4e;
+  --sidebar-primary-foreground: #1a1208;
+  --sidebar-accent: #14243a;
+  --sidebar-accent-foreground: #edf2f8;
+  --sidebar-border: #263b54;
+  --sidebar-ring: #54d8c4;
   --chip-match-title-bg: oklch(0.27 0.04 265 / 0.5);
   --chip-match-title-fg: oklch(0.78 0.10 265);
   --chip-match-title-border: oklch(0.4 0.06 265);

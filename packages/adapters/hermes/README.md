@@ -29,7 +29,7 @@ This adapter provides:
 - **Benign stderr reclassification** — MCP init messages and structured logs are reclassified so they don't appear as errors in the UI
 - **Session source tagging** — Sessions are tagged as `tool` source so they don't clutter the user's interactive history
 - **Filesystem checkpoints** — Optional `--checkpoints` for rollback safety
-- **Thinking effort control** — Passes `--reasoning-effort` for thinking/reasoning models
+- **Thinking effort control** — Passes Hermes Agent's current `--reasoning` flag and removes obsolete or duplicate reasoning flags
 
 ### Hermes Agent Capabilities
 

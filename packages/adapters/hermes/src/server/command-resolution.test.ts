@@ -19,15 +19,15 @@ test("resolveHermesCommand falls back to command before default hermes binary", 
 
 test("testEnvironment accepts config.command when hermesCommand is absent", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-command-resolution-"));
-  const cliPath = path.join(tempDir, "fake-hermes");
+  const isWindows = process.platform === "win32";
+  const cliPath = isWindows ? process.execPath : path.join(tempDir, "fake-hermes");
+  const expectedVersion = isWindows ? process.version : "fake-hermes 1.2.3";
 
   try {
-    await writeFile(
-      cliPath,
-      "#!/bin/sh\necho fake-hermes 1.2.3\n",
-      "utf8",
-    );
-    await chmod(cliPath, 0o755);
+    if (!isWindows) {
+      await writeFile(cliPath, "#!/bin/sh\necho fake-hermes 1.2.3\n", "utf8");
+      await chmod(cliPath, 0o755);
+    }
 
     const result = await testEnvironment({
       companyId: "company-test",
@@ -40,7 +40,7 @@ test("testEnvironment accepts config.command when hermesCommand is absent", asyn
     expect(result.status).not.toBe("fail");
     expect(result.checks.some((check) => check.code === "hermes_cli_not_found")).toBe(false);
     expect(result.checks.some(
-      (check) => check.code === "hermes_version" && check.message.includes("fake-hermes 1.2.3"),
+      (check) => check.code === "hermes_version" && check.message.includes(expectedVersion),
     )).toBe(true);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
